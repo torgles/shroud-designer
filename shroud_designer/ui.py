@@ -302,11 +302,16 @@ class MainWindow(QMainWindow):
         group = QGroupBox("3   FUNNEL")
         layout = QVBoxLayout(group)
         common = QFormLayout()
-        self.wall = _spin(0.4, 10.0, 1.0, decimals=2, step=0.1)
+        self.wall_info = QLabel("Detected from the GPU connector top rim")
+        self.wall_info.setObjectName("infoPill")
+        self.wall_info.setWordWrap(True)
+        self.wall_info.setToolTip(
+            "The funnel traces the connector's inner and outer top perimeters, then continues at the detected rim thickness."
+        )
         self.funnel_mode = _PanelComboBox()
         self.funnel_mode.addItem("Straight / offset", False)
         self.funnel_mode.addItem("Compound curve", True)
-        common.addRow("Wall thickness", self.wall)
+        common.addRow("Wall thickness", self.wall_info)
         common.addRow("Path", self.funnel_mode)
         layout.addLayout(common)
 
@@ -407,7 +412,6 @@ class MainWindow(QMainWindow):
         self.fan_spacing.valueChanged.connect(self._fan_layout_changed)
         self.fan_bridge.currentIndexChanged.connect(self._fan_layout_changed)
         for control in (
-            self.wall,
             self.fan_hole,
             self.screw_hole,
             self.length,
@@ -511,8 +515,10 @@ class MainWindow(QMainWindow):
         count = self.connector_count.value()
         copies = "" if count == 1 else f"  •  {count} copies along {str(self.stack_axis.currentData()).upper()}"
         self.gpu_info.setText(
-            f"Top Z {self.connector.top_z:.2f} mm  •  opening {opening.width:.1f} x {opening.depth:.1f} mm{copies}"
+            f"Top Z {self.connector.top_z:.2f} mm  •  opening {opening.width:.1f} x {opening.depth:.1f} mm"
+            f"  •  rim {opening.wall_thickness:.2f} mm{copies}"
         )
+        self.wall_info.setText(f"Auto — {opening.wall_thickness:.2f} mm from top rim")
 
     def _connector_layout_changed(self) -> None:
         self._has_fitted_assembly = False
@@ -597,7 +603,6 @@ class MainWindow(QMainWindow):
         if self.connector is None:
             raise GeometryError("Choose a GPU connector STL first.")
         funnel = FunnelConfig(
-            wall_thickness=self.wall.value(),
             curved=bool(self.funnel_mode.currentData()),
             length=self.length.value(),
             offset_x=self.offset_x.value(),
@@ -669,6 +674,7 @@ class MainWindow(QMainWindow):
                 f"Preview ready • {parts.funnel_result.centerline_length:.1f} mm centerline "
                 f"• {self.connector_count.value()} GPU connector(s) "
                 f"• {self.fan_count.value()} fan(s) "
+                f"• {self.connector.opening.wall_thickness:.2f} mm auto wall "
                 f"• {len(parts.funnel.faces):,} funnel triangles"
             )
             if parts.funnel_result.warnings:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from shapely.geometry import Polygon
 
 from shroud_designer.geometry import (
     ConnectorStackConfig,
@@ -20,6 +21,7 @@ from shroud_designer.geometry import (
     mesh_component_count,
     union_assembly,
 )
+from shroud_designer.geometry import _resample_boundary
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,11 +34,65 @@ def connector():
     return analyze_connector(GPU)
 
 
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        Polygon([(0.0, 0.0), (37.0, 0.0), (37.0, 19.0), (0.0, 19.0)]),
+        Polygon(
+            [
+                (0.0, 0.0),
+                (40.0, 0.0),
+                (40.0, 30.0),
+                (24.0, 30.0),
+                (24.0, 18.0),
+                (0.0, 18.0),
+            ]
+        ),
+    ],
+)
+def test_boundary_resampling_preserves_sharp_corners(polygon: Polygon) -> None:
+    sampled = _resample_boundary(polygon, 32)
+    corners = np.asarray(polygon.exterior.coords[:-1], dtype=float)
+    distances = np.linalg.norm(corners[:, None, :] - sampled[None, :, :], axis=2)
+
+    assert sampled.shape == (32, 2)
+    assert np.all(np.min(distances, axis=1) < 1e-9)
+
+
 def test_detects_topmost_gpu_opening(connector) -> None:
     assert connector.mesh.is_watertight
     assert connector.top_z == pytest.approx(21.75, abs=0.01)
     assert connector.opening.width == pytest.approx(38.705, abs=0.05)
     assert connector.opening.depth == pytest.approx(98.397, abs=0.05)
+    assert connector.opening.wall_thickness == pytest.approx(1.898, abs=0.02)
+
+
+def test_funnel_automatically_traces_connector_top_rim(connector) -> None:
+    parts = build_assembly_parts(
+        connector,
+        FunnelConfig(length=30.0, radial_segments=128, path_segments=24),
+        fan_config=FanConfig(),
+    )
+    inlet_z = connector.top_z - FunnelConfig().join_overlap
+    inlet_vertices = parts.funnel.vertices[
+        np.isclose(parts.funnel.vertices[:, 2], inlet_z, atol=1e-6)
+    ][:, :2]
+    outer_points = np.asarray(connector.outer_polygon.exterior.coords[:-1])
+    incoming = outer_points - np.roll(outer_points, 1, axis=0)
+    outgoing = np.roll(outer_points, -1, axis=0) - outer_points
+    cosine = np.sum(incoming * outgoing, axis=1) / (
+        np.linalg.norm(incoming, axis=1) * np.linalg.norm(outgoing, axis=1)
+    )
+    outer_corners = outer_points[
+        np.arccos(np.clip(cosine, -1.0, 1.0)) >= radians(15.0)
+    ]
+    distances = np.linalg.norm(
+        outer_corners[:, None, :] - inlet_vertices[None, :, :], axis=2
+    )
+
+    assert FunnelConfig().wall_thickness is None
+    assert np.all(np.min(distances, axis=1) < 1e-6)
+    assert parts.funnel.is_watertight
 
 
 def test_reference_fan_measurements() -> None:

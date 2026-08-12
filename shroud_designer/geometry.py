@@ -24,6 +24,7 @@ class OpeningCandidate:
     area: float
     width: float
     depth: float
+    wall_thickness: float
 
     @property
     def label(self) -> str:
@@ -57,7 +58,7 @@ class FanAnalysis:
 
 @dataclass(slots=True)
 class FunnelConfig:
-    wall_thickness: float = 1.0
+    wall_thickness: float | None = None
     curved: bool = False
     length: float = 50.0
     offset_x: float = 0.0
@@ -252,6 +253,32 @@ def _contained_holes(outer: Polygon, polygons: Iterable[Polygon]) -> list[Polygo
     return sorted(holes, key=lambda item: item.area, reverse=True)
 
 
+def _infer_wall_thickness(opening: Polygon, outer: Polygon) -> float:
+    """Estimate the nominal top-rim width without being skewed by tabs or corners."""
+    ring = opening.exterior
+    sample_count = max(256, min(2048, len(ring.coords) * 16))
+    distances = np.asarray(
+        [
+            outer.exterior.distance(
+                ring.interpolate(ring.length * index / sample_count)
+            )
+            for index in range(sample_count)
+        ],
+        dtype=float,
+    )
+    distances = distances[np.isfinite(distances) & (distances > 0.05)]
+    if len(distances) < sample_count // 4:
+        raise GeometryError(
+            "Could not determine the wall thickness around the selected top opening."
+        )
+    thickness = float(np.median(distances))
+    if thickness <= 0.05:
+        raise GeometryError(
+            "The selected top opening does not have a measurable surrounding wall."
+        )
+    return thickness
+
+
 def analyze_connector(path: str | Path) -> ConnectorAnalysis:
     mesh = _load_mesh(path)
     if not mesh.is_watertight:
@@ -276,6 +303,7 @@ def analyze_connector(path: str | Path) -> ConnectorAnalysis:
                 area=float(polygon.area),
                 width=float(max_x - min_x),
                 depth=float(max_y - min_y),
+                wall_thickness=_infer_wall_thickness(polygon, outer),
             )
         )
     return ConnectorAnalysis(Path(path), mesh, top_z, candidates, outer)
@@ -315,6 +343,7 @@ def _resample_boundary(
     polygon: Polygon,
     count: int,
     start_near: np.ndarray | None = None,
+    preserve_corners: bool = True,
 ) -> np.ndarray:
     polygon = orient(polygon, sign=1.0)
     ring = polygon.exterior
@@ -323,6 +352,51 @@ def _resample_boundary(
         [ring.interpolate(length * index / count).coords[0] for index in range(count)],
         dtype=float,
     )
+    coordinates = np.asarray(ring.coords[:-1], dtype=float)
+
+    # Uniform perimeter samples normally miss polygon vertices. Connecting the
+    # samples then replaces every missed vertex with a chord, visibly clipping
+    # square and stepped connector openings. Snap nearby samples onto meaningful
+    # direction changes while leaving the rest of the uniform parameterization
+    # intact; the latter keeps inner/outer and inlet/outlet rings aligned.
+    previous = np.roll(coordinates, 1, axis=0)
+    following = np.roll(coordinates, -1, axis=0)
+    incoming = coordinates - previous
+    outgoing = following - coordinates
+    incoming_length = np.linalg.norm(incoming, axis=1)
+    outgoing_length = np.linalg.norm(outgoing, axis=1)
+    valid = (incoming_length > 1e-7) & (outgoing_length > 1e-7)
+    cosine = np.ones(len(coordinates), dtype=float)
+    cosine[valid] = np.sum(incoming[valid] * outgoing[valid], axis=1) / (
+        incoming_length[valid] * outgoing_length[valid]
+    )
+    turns = np.arccos(np.clip(cosine, -1.0, 1.0))
+    corner_indices = np.flatnonzero(valid & (turns >= radians(15.0)))
+
+    if not preserve_corners:
+        corner_indices = np.empty(0, dtype=int)
+    elif len(corner_indices) > count:
+        strongest = np.argsort(-turns[corner_indices])[:count]
+        corner_indices = np.sort(corner_indices[strongest])
+
+    if len(corner_indices):
+        segment_lengths = np.linalg.norm(following - coordinates, axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+        corner_distances = cumulative[corner_indices]
+        ideal_slots = corner_distances / length * count
+
+        # Assign strictly increasing slots so clustered CAD vertices cannot
+        # reorder the ring. A corner near the closing point belongs in the last
+        # slot, not slot zero, unless it is genuinely the first coordinate.
+        assigned_slots: list[int] = []
+        previous_slot = -1
+        corner_total = len(corner_indices)
+        for position, ideal_slot in enumerate(ideal_slots):
+            slot = max(int(round(float(ideal_slot))), previous_slot + 1)
+            slot = min(slot, count - (corner_total - position))
+            assigned_slots.append(slot)
+            previous_slot = slot
+        points[np.asarray(assigned_slots, dtype=int)] = coordinates[corner_indices]
     if start_near is None:
         # A stable start point on the right side minimizes visible loft twist.
         center = np.asarray(polygon.centroid.coords[0])
@@ -417,11 +491,14 @@ def _solid_loft(
     point_count: int,
     sections: int,
     convergence_fraction: float,
+    preserve_corners: bool = True,
 ) -> trimesh.Trimesh:
     start = orient(start, sign=1.0)
     end = orient(end, sign=1.0)
-    start_points = _resample_boundary(start, point_count)
-    end_points = _resample_boundary(end, point_count)
+    start_points = _resample_boundary(
+        start, point_count, preserve_corners=preserve_corners
+    )
+    end_points = _resample_boundary(end, point_count, preserve_corners=preserve_corners)
     rings: list[np.ndarray] = []
     for fraction in np.linspace(0.0, 1.0, max(2, sections) + 1):
         shape_fraction = min(fraction / convergence_fraction, 1.0)
@@ -599,6 +676,7 @@ def _make_branch_manifold(
     point_count: int,
     path_segments: int,
     overlap: float,
+    inlet_outer_polygons: list[Polygon] | None = None,
 ) -> tuple[trimesh.Trimesh, Polygon]:
     combined = unary_union(openings).convex_hull
     if not isinstance(combined, Polygon):
@@ -615,17 +693,29 @@ def _make_branch_manifold(
     # Separate straight ducts enter a short collector chamber. Building the
     # material as outer solid volumes minus overlapping airflow volumes keeps
     # the manifold reliable from two connectors all the way through ten.
+    trace_inlet_corners = inlet_outer_polygons is not None
+    if inlet_outer_polygons is None:
+        inlet_outer_polygons = [
+            opening.buffer(wall_thickness, join_style="round")
+            for opening in openings
+        ]
+    if len(inlet_outer_polygons) != len(openings):
+        raise GeometryError("Each opening needs a matching outside top perimeter.")
+
     outer_volumes = [
         _solid_loft(
-            opening.buffer(wall_thickness, join_style="round"),
+            inlet_outer,
             top_z - overlap,
             opening.buffer(wall_thickness, join_style="round"),
             chamber_bottom + overlap,
             point_count,
             sections,
             1.0,
+            preserve_corners=trace_inlet_corners,
         )
-        for opening in openings
+        for opening, inlet_outer in zip(
+            openings, inlet_outer_polygons, strict=True
+        )
     ]
     outer_volumes.append(
         _solid_loft(
@@ -636,6 +726,7 @@ def _make_branch_manifold(
             point_count,
             4,
             1.0,
+            preserve_corners=False,
         )
     )
     inner_volumes = [
@@ -659,6 +750,7 @@ def _make_branch_manifold(
             point_count,
             4,
             1.0,
+            preserve_corners=False,
         )
     )
     outer = _boolean_union(outer_volumes, "the outside of the connector branches")
@@ -686,21 +778,37 @@ def make_funnel(
     top_z: float,
     config: FunnelConfig,
     outlet_polygon: Polygon | None = None,
+    inlet_outer_polygon: Polygon | None = None,
+    preserve_opening_corners: bool = True,
+    preserve_outlet_corners: bool = True,
 ) -> FunnelResult:
-    if config.wall_thickness <= 0:
+    if config.wall_thickness is None or config.wall_thickness <= 0:
         raise GeometryError("Wall thickness must be greater than zero.")
     if config.outlet_diameter <= 0:
         raise GeometryError("Fan hole diameter must be greater than zero.")
 
     opening = orient(opening, sign=1.0)
-    buffered = opening.buffer(config.wall_thickness, join_style="round")
+    buffered = (
+        orient(inlet_outer_polygon, sign=1.0)
+        if inlet_outer_polygon is not None
+        else opening.buffer(config.wall_thickness, join_style="round")
+    )
     if not isinstance(buffered, Polygon):
         raise GeometryError("The selected opening cannot be offset into a funnel wall.")
+    if not buffered.buffer(1e-5).contains(opening):
+        raise GeometryError("The outside top perimeter does not contain the selected opening.")
 
     count = max(32, int(config.radial_segments))
     center_2d = np.asarray(opening.centroid.coords[0], dtype=float)
-    base_inner_abs = _resample_boundary(opening, count)
-    base_outer_abs = _resample_boundary(buffered, count, base_inner_abs[0])
+    base_inner_abs = _resample_boundary(
+        opening, count, preserve_corners=preserve_opening_corners
+    )
+    base_outer_abs = _resample_boundary(
+        buffered,
+        count,
+        base_inner_abs[0],
+        preserve_corners=inlet_outer_polygon is not None,
+    )
     base_inner = base_inner_abs - center_2d
     base_outer = base_outer_abs - center_2d
 
@@ -727,8 +835,12 @@ def make_funnel(
         )
         if not isinstance(buffered_outlet, Polygon):
             raise GeometryError("The fan openings cannot be offset into a funnel wall.")
-        outlet_inner = _resample_boundary(centered_outlet, count)
-        outlet_outer = _resample_boundary(buffered_outlet, count, outlet_inner[0])
+        outlet_inner = _resample_boundary(
+            centered_outlet, count, preserve_corners=preserve_outlet_corners
+        )
+        outlet_outer = _resample_boundary(
+            buffered_outlet, count, outlet_inner[0], preserve_corners=False
+        )
         outlet_radius = float(np.max(np.linalg.norm(outlet_outer, axis=1)))
 
     base_center = np.array([center_2d[0], center_2d[1], top_z], dtype=float)
@@ -937,7 +1049,16 @@ def build_assembly_parts(
     local_fan.vertices = local_vertices
     local_fan.remove_unreferenced_vertices()
 
-    working_config = replace(funnel_config, outlet_diameter=outlet_diameter)
+    wall_thickness = (
+        connector.opening.wall_thickness
+        if funnel_config.wall_thickness is None
+        else funnel_config.wall_thickness
+    )
+    working_config = replace(
+        funnel_config,
+        outlet_diameter=outlet_diameter,
+        wall_thickness=wall_thickness,
+    )
 
     stack = stack_config or ConnectorStackConfig()
     _validate_stack(stack.count, 10, stack.axis, stack.spacing, "GPU connector")
@@ -961,6 +1082,7 @@ def build_assembly_parts(
     )
     gpu_meshes = []
     openings = []
+    outer_openings = []
     for translation in translations:
         gpu = connector.mesh.copy()
         gpu.apply_translation(translation)
@@ -968,6 +1090,13 @@ def build_assembly_parts(
         openings.append(
             translate_polygon(
                 connector.opening.polygon,
+                xoff=float(translation[0]),
+                yoff=float(translation[1]),
+            )
+        )
+        outer_openings.append(
+            translate_polygon(
+                connector.outer_polygon,
                 xoff=float(translation[0]),
                 yoff=float(translation[1]),
             )
@@ -1034,6 +1163,7 @@ def build_assembly_parts(
             max(32, int(working_config.radial_segments)),
             max(8, int(working_config.path_segments)),
             effective_overlap,
+            inlet_outer_polygons=outer_openings,
         )
         funnel_meshes.append(gpu_branches)
 
@@ -1042,6 +1172,9 @@ def build_assembly_parts(
         main_start_z,
         working_config,
         outlet_polygon=outlet_opening,
+        inlet_outer_polygon=outer_openings[0] if stack.count == 1 else None,
+        preserve_opening_corners=stack.count == 1,
+        preserve_outlet_corners=fan_stack.count == 1,
     )
     funnel_meshes.append(main_funnel.mesh)
 
