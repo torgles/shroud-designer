@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import trimesh
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon, box
 
 from shroud_designer.geometry import (
     ConnectorStackConfig,
@@ -24,12 +24,31 @@ from shroud_designer.geometry import (
     mesh_component_count,
     union_assembly,
 )
-from shroud_designer.geometry import _resample_boundary, _slice_polygons
+from shroud_designer.geometry import _contained_holes, _resample_boundary, _slice_polygons
 
 
 ROOT = Path(__file__).resolve().parents[1]
 GPU = ROOT / "GPU Connectors" / "cmp front.stl"
 FAN = ROOT / "Fans" / "default 120mm fan for shroud.stl"
+
+
+def _dual_fan_bracket(path: Path) -> Path:
+    """Create an 80 x 40 mm plate with two independent 36 mm air openings."""
+    plate = box(-40.0, -20.0, 40.0, 20.0)
+    cuts = [
+        Point(-20.0, 0.0).buffer(18.0, quad_segs=48),
+        Point(20.0, 0.0).buffer(18.0, quad_segs=48),
+    ]
+    for x in (-36.0, -4.0, 4.0, 36.0):
+        for y in (-16.0, 16.0):
+            cuts.append(Point(x, y).buffer(1.5, quad_segs=16))
+    for cut in cuts:
+        plate = plate.difference(cut)
+    assert isinstance(plate, Polygon)
+    mesh = trimesh.creation.extrude_polygon(plate, height=3.0, engine="earcut")
+    assert mesh.is_watertight
+    mesh.export(path)
+    return path
 
 
 def _vertical_solid_intervals(
@@ -320,6 +339,10 @@ def test_reference_fan_measurements() -> None:
     fan = analyze_fan(FAN)
     assert fan.mesh.is_watertight
     assert fan.hole_diameter == pytest.approx(116.005, abs=0.03)
+    assert fan.outer_width == pytest.approx(120.0, abs=0.03)
+    assert fan.outer_depth == pytest.approx(120.0, abs=0.2)
+    assert fan.use_outer_boundary is True
+    assert fan.rotation_angle == 0.0
     assert fan.z_max - fan.z_min == pytest.approx(3.0, abs=0.01)
 
 
@@ -381,7 +404,7 @@ def test_compound_curve_rotates_fan_perpendicular(connector) -> None:
     assert mesh_component_count(final) == 1
 
 
-def test_imported_fan_uses_detected_opening(connector) -> None:
+def test_imported_fan_uses_bracket_outline_by_default(connector) -> None:
     fan = analyze_fan(FAN)
     parts = build_assembly_parts(
         connector,
@@ -391,6 +414,84 @@ def test_imported_fan_uses_detected_opening(connector) -> None:
     assert parts.fan.is_watertight
     assert parts.funnel_result.mesh.is_watertight
     assert parts.funnel_result.outlet_center[2] == pytest.approx(connector.top_z + 35.0)
+
+
+def test_imported_fan_can_use_detected_opening_instead(connector) -> None:
+    fan = analyze_fan(FAN)
+    fan.use_outer_boundary = False
+    parts = build_assembly_parts(
+        connector,
+        FunnelConfig(length=35.0),
+        imported_fan=fan,
+    )
+    outlet_z = parts.funnel_result.outlet_center[2] - 0.01
+    contours = _slice_polygons(parts.funnel, outlet_z)
+    holes = _contained_holes(contours[0], contours[1:])
+    min_x, min_y, max_x, max_y = holes[0].bounds
+
+    assert max_x - min_x == pytest.approx(fan.hole_diameter, abs=0.1)
+    assert max_y - min_y == pytest.approx(fan.hole_diameter, abs=0.1)
+
+
+def test_dual_opening_bracket_exports_as_open_watertight_plenum(
+    connector, tmp_path: Path
+) -> None:
+    fan = analyze_fan(_dual_fan_bracket(tmp_path / "dual-fan-bracket.stl"))
+    assert fan.use_outer_boundary is True
+    assert fan.outer_width == pytest.approx(80.0, abs=0.02)
+    assert fan.outer_depth == pytest.approx(40.0, abs=0.02)
+    assert fan.hole_diameter == pytest.approx(36.0, abs=0.03)
+
+    parts = build_assembly_parts(
+        connector,
+        FunnelConfig(length=50.0, radial_segments=96, path_segments=48),
+        imported_fan=fan,
+    )
+    target = tmp_path / "dual-fan-plenum.stl"
+    result = export_stl(parts, target)
+    plate_z = parts.funnel_result.outlet_center[2] + 1.0
+    contours = _slice_polygons(result, plate_z)
+    holes = _contained_holes(contours[0], contours[1:])
+    airflow_holes = [hole for hole in holes if hole.area > 900.0]
+
+    assert target.is_file()
+    assert result.is_watertight
+    assert mesh_component_count(result) == 1
+    assert len(airflow_holes) == 2
+
+
+def test_imported_bracket_rotation_moves_plate_and_funnel_together(
+    connector, tmp_path: Path
+) -> None:
+    fan_path = _dual_fan_bracket(tmp_path / "rotating-dual-fan-bracket.stl")
+    unrotated = analyze_fan(fan_path)
+    straight_parts = build_assembly_parts(
+        connector,
+        FunnelConfig(length=50.0, radial_segments=96, path_segments=48),
+        imported_fan=unrotated,
+    )
+
+    rotated = analyze_fan(fan_path)
+    rotated.rotation_angle = 90.0
+    rotated_parts = build_assembly_parts(
+        connector,
+        FunnelConfig(length=50.0, radial_segments=96, path_segments=48),
+        imported_fan=rotated,
+    )
+    outlet_z = rotated_parts.funnel_result.outlet_center[2] - 0.01
+    contours = _slice_polygons(rotated_parts.funnel, outlet_z)
+    holes = _contained_holes(contours[0], contours[1:])
+    min_x, min_y, max_x, max_y = holes[0].bounds
+    final = union_assembly(rotated_parts)
+
+    assert straight_parts.fan.extents[0] == pytest.approx(80.0, abs=0.02)
+    assert straight_parts.fan.extents[1] == pytest.approx(40.0, abs=0.02)
+    assert rotated_parts.fan.extents[0] == pytest.approx(40.0, abs=0.02)
+    assert rotated_parts.fan.extents[1] == pytest.approx(80.0, abs=0.02)
+    assert max_x - min_x == pytest.approx(40.0, abs=0.1)
+    assert max_y - min_y == pytest.approx(80.0, abs=0.1)
+    assert final.is_watertight
+    assert mesh_component_count(final) == 1
 
 
 def test_exports_binary_stl(connector, tmp_path: Path) -> None:

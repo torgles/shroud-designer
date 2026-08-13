@@ -104,7 +104,7 @@ def _spin(
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Shroud Designer 0.4")
+        self.setWindowTitle("Shroud Designer 0.4.5")
         icon = app_icon_path()
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -143,7 +143,7 @@ class MainWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch()
-        version = QLabel("VERSION 0.4")
+        version = QLabel("VERSION 0.4.5")
         version.setObjectName("versionBadge")
         header_row.addWidget(version, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(header_row)
@@ -279,6 +279,31 @@ class MainWindow(QMainWindow):
         fan_file_row.addWidget(self.fan_path, 1)
         fan_file_row.addWidget(self.fan_browse)
         layout.addWidget(self.fan_file_widget)
+
+        self.imported_fan_options = QWidget()
+        imported_form = QFormLayout(self.imported_fan_options)
+        imported_form.setContentsMargins(0, 0, 0, 0)
+        self.fan_outline = QCheckBox("Snap to bracket outline (not opening)")
+        self.fan_outline.setChecked(
+            bool(self.settings.value("fan_snap_outline", True, type=bool))
+        )
+        self.fan_outline.setToolTip(
+            "Builds a plenum to the imported bracket's full outside perimeter. This keeps every airflow opening in a multi-fan bracket usable."
+        )
+        self.fan_rotation = _spin(
+            -180.0,
+            180.0,
+            float(self.settings.value("fan_rotation", 0.0)),
+            "°",
+            decimals=1,
+            step=5.0,
+        )
+        self.fan_rotation.setToolTip(
+            "Rotates the imported bracket and its funnel connection together around the outlet axis."
+        )
+        imported_form.addRow(self.fan_outline)
+        imported_form.addRow("Rotation", self.fan_rotation)
+        layout.addWidget(self.imported_fan_options)
 
         self.custom_fan_widget = QWidget()
         custom_form = QFormLayout(self.custom_fan_widget)
@@ -416,6 +441,8 @@ class MainWindow(QMainWindow):
         self.opening_combo.currentIndexChanged.connect(self._opening_changed)
         self.fan_mode.currentIndexChanged.connect(self._fan_mode_changed)
         self.fan_size.currentIndexChanged.connect(self._fan_size_changed)
+        self.fan_outline.toggled.connect(self._imported_fan_options_changed)
+        self.fan_rotation.valueChanged.connect(self._imported_fan_options_changed)
         self.funnel_mode.currentIndexChanged.connect(self._funnel_mode_changed)
         self.v03_mode.toggled.connect(self._funnel_method_changed)
         self.connector_count.valueChanged.connect(self._connector_layout_changed)
@@ -508,6 +535,8 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self.imported_fan = analysis
+        analysis.use_outer_boundary = self.fan_outline.isChecked()
+        analysis.rotation_angle = self.fan_rotation.value()
         self.fan_path.setText(str(path))
         self.fan_path.setToolTip(str(path))
         self._update_fan_info()
@@ -563,6 +592,18 @@ class MainWindow(QMainWindow):
         self._update_fan_info()
         self.schedule_preview()
 
+    def _imported_fan_options_changed(self, *_args: object) -> None:
+        checked = self.fan_outline.isChecked()
+        rotation = self.fan_rotation.value()
+        self.settings.setValue("fan_snap_outline", checked)
+        self.settings.setValue("fan_rotation", rotation)
+        if self.imported_fan is not None:
+            self.imported_fan.use_outer_boundary = checked
+            self.imported_fan.rotation_angle = rotation
+        self._has_fitted_assembly = False
+        self._update_fan_info()
+        self.schedule_preview()
+
     def _update_fan_info(self) -> None:
         count = self.fan_count.value()
         copies = (
@@ -572,10 +613,19 @@ class MainWindow(QMainWindow):
         )
         if self.fan_mode.currentData() == "import" and self.imported_fan is not None:
             analysis = self.imported_fan
-            description = (
-                f"Detected {analysis.hole_diameter:.2f} mm opening • "
-                f"{analysis.z_max - analysis.z_min:.2f} mm thick"
-            )
+            if analysis.use_outer_boundary:
+                description = (
+                    f"Funnel uses {analysis.outer_width:.1f} × {analysis.outer_depth:.1f} mm bracket outline • "
+                    f"largest opening {analysis.hole_diameter:.2f} mm"
+                )
+            else:
+                description = (
+                    f"Funnel uses {analysis.hole_diameter:.2f} mm opening • "
+                    f"bracket {analysis.outer_width:.1f} × {analysis.outer_depth:.1f} mm"
+                )
+            description += f" • {analysis.z_max - analysis.z_min:.2f} mm thick"
+            if abs(analysis.rotation_angle) > 1e-9:
+                description += f" • rotated {analysis.rotation_angle:g}°"
         else:
             size = float(self.fan_size.currentData())
             spacing = 124.5 if size == 140.0 else 105.0
@@ -594,6 +644,7 @@ class MainWindow(QMainWindow):
     def _update_mode_controls(self) -> None:
         imported = self.fan_mode.currentData() == "import"
         self.fan_file_widget.setVisible(imported)
+        self.imported_fan_options.setVisible(imported)
         self.custom_fan_widget.setEnabled(not imported)
         curved = bool(self.funnel_mode.currentData())
         self.straight_widget.setEnabled(not curved)

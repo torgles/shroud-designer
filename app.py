@@ -44,6 +44,7 @@ def self_test(report_path: Path) -> int:
                 fan_config=FanConfig(),
             )
         )
+        reference_fan.rotation_angle = 15.0
         curved = union_assembly(
             build_assembly_parts(
                 connector,
@@ -128,6 +129,8 @@ def self_test(report_path: Path) -> int:
                 "triangles": len(straight.faces),
             },
             "curved": {
+                "imported_fan_outline": bool(reference_fan.use_outer_boundary),
+                "imported_fan_rotation_degrees": reference_fan.rotation_angle,
                 "watertight": bool(curved.is_watertight),
                 "components": mesh_component_count(curved),
                 "triangles": len(curved.faces),

@@ -28,17 +28,17 @@ jobs:
             choco install innosetup --yes --no-progress
           }
 
-      - name: Build and self-test v0.4
+      - name: Build and self-test v0.4.5
         shell: powershell
         run: .\build.ps1
 
       - name: Upload Windows test artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ShroudDesigner-0.4-windows-x86_64
+          name: ShroudDesigner-0.4.5-windows-x86_64
           if-no-files-found: error
           retention-days: 14
           path: |
-            dist/ShroudDesigner-0.4-Setup.exe
-            dist/ShroudDesigner-0.4-windows-x86_64.zip
+            dist/ShroudDesigner-0.4.5-Setup.exe
+            dist/ShroudDesigner-0.4.5-windows-x86_64.zip
             dist/SHA256SUMS-windows.txt

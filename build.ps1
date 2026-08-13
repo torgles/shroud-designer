@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $ProjectRoot
-$Version = "0.4"
+$Version = "0.4.5"
 
 python -m pip install -r requirements-dev.txt
 if (-not $SkipTests) {

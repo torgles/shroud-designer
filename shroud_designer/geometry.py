@@ -11,6 +11,7 @@ import trimesh
 import mapbox_earcut
 import shapely
 from manifold3d import Manifold, Mesh
+from shapely.affinity import rotate as rotate_polygon
 from shapely.affinity import translate as translate_polygon
 from shapely.geometry import Point, Polygon, box
 from shapely.geometry.polygon import orient
@@ -55,8 +56,22 @@ class FanAnalysis:
     hole_polygon: Polygon
     hole_center: np.ndarray
     hole_diameter: float
+    outer_polygon: Polygon
+    outer_center: np.ndarray
+    outer_width: float
+    outer_depth: float
     z_min: float
     z_max: float
+    use_outer_boundary: bool = True
+    rotation_angle: float = 0.0
+
+    @property
+    def active_polygon(self) -> Polygon:
+        return self.outer_polygon if self.use_outer_boundary else self.hole_polygon
+
+    @property
+    def active_center(self) -> np.ndarray:
+        return self.outer_center if self.use_outer_boundary else self.hole_center
 
 
 @dataclass(slots=True)
@@ -333,12 +348,18 @@ def analyze_fan(path: str | Path) -> FanAnalysis:
     center = hole.centroid
     min_x, min_y, max_x, max_y = hole.bounds
     diameter = ((max_x - min_x) + (max_y - min_y)) / 2.0
+    outer_center = outer.centroid
+    outer_min_x, outer_min_y, outer_max_x, outer_max_y = outer.bounds
     return FanAnalysis(
         Path(path),
         mesh,
         hole,
         np.array([center.x, center.y], dtype=float),
         float(diameter),
+        outer,
+        np.array([outer_center.x, outer_center.y], dtype=float),
+        float(outer_max_x - outer_min_x),
+        float(outer_max_y - outer_min_y),
         z_min,
         z_max,
     )
@@ -1642,10 +1663,27 @@ def build_assembly_parts(
     if imported_fan is not None:
         outlet_diameter = imported_fan.hole_diameter
         local_fan = imported_fan.mesh.copy()
-        local_hole_center = imported_fan.hole_center
+        local_hole_center = imported_fan.active_center.copy()
         local_z_min = imported_fan.z_min
+        active_polygon = imported_fan.active_polygon
+        if abs(imported_fan.rotation_angle) > 1e-9:
+            rotation = trimesh.transformations.rotation_matrix(
+                radians(imported_fan.rotation_angle),
+                [0.0, 0.0, 1.0],
+                point=[
+                    float(local_hole_center[0]),
+                    float(local_hole_center[1]),
+                    0.0,
+                ],
+            )
+            local_fan.apply_transform(rotation)
+            active_polygon = rotate_polygon(
+                active_polygon,
+                imported_fan.rotation_angle,
+                origin=(float(local_hole_center[0]), float(local_hole_center[1])),
+            )
         fan_opening = translate_polygon(
-            imported_fan.hole_polygon,
+            active_polygon,
             xoff=-float(local_hole_center[0]),
             yoff=-float(local_hole_center[1]),
         )
