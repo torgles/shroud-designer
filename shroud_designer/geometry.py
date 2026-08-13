@@ -65,6 +65,7 @@ class FunnelConfig:
     curved: bool = False
     length: float = 50.0
     rounding_start: float = 8.0
+    legacy_v03: bool = False
     offset_x: float = 0.0
     offset_y: float = 0.0
     angle_x: float = 0.0
@@ -987,6 +988,189 @@ def _make_branch_manifold(
     return shell, combined
 
 
+def _make_funnel_v03(
+    opening: Polygon,
+    top_z: float,
+    config: FunnelConfig,
+    outlet_polygon: Polygon | None = None,
+    inlet_outer_polygon: Polygon | None = None,
+    preserve_opening_corners: bool = True,
+    preserve_outlet_corners: bool = True,
+) -> FunnelResult:
+    """Generate a funnel with the exact contour-loft method shipped in 0.3."""
+    if config.wall_thickness is None or config.wall_thickness <= 0:
+        raise GeometryError("Wall thickness must be greater than zero.")
+    if config.outlet_diameter <= 0:
+        raise GeometryError("Fan hole diameter must be greater than zero.")
+
+    opening = orient(opening, sign=1.0)
+    buffered = (
+        orient(inlet_outer_polygon, sign=1.0)
+        if inlet_outer_polygon is not None
+        else opening.buffer(config.wall_thickness, join_style="round")
+    )
+    if not isinstance(buffered, Polygon):
+        raise GeometryError("The selected opening cannot be offset into a funnel wall.")
+    if not buffered.buffer(1e-5).contains(opening):
+        raise GeometryError("The outside top perimeter does not contain the selected opening.")
+
+    count = max(32, int(config.radial_segments))
+    center_2d = np.asarray(opening.centroid.coords[0], dtype=float)
+    base_inner_abs = _resample_boundary(
+        opening, count, preserve_corners=preserve_opening_corners
+    )
+    base_outer_abs = _resample_boundary(
+        buffered,
+        count,
+        base_inner_abs[0],
+        preserve_corners=inlet_outer_polygon is not None,
+    )
+    base_inner = base_inner_abs - center_2d
+    base_outer = base_outer_abs - center_2d
+
+    if outlet_polygon is None:
+        start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
+        angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
+        outlet_inner = np.column_stack((np.cos(angles), np.sin(angles))) * (
+            config.outlet_diameter / 2.0
+        )
+        outlet_outer = np.column_stack((np.cos(angles), np.sin(angles))) * (
+            config.outlet_diameter / 2.0 + config.wall_thickness
+        )
+        outlet_radius = config.outlet_diameter / 2.0 + config.wall_thickness
+    else:
+        outlet_polygon = orient(outlet_polygon, sign=1.0)
+        outlet_center_2d = np.asarray(outlet_polygon.centroid.coords[0], dtype=float)
+        centered_outlet = translate_polygon(
+            outlet_polygon,
+            xoff=-float(outlet_center_2d[0]),
+            yoff=-float(outlet_center_2d[1]),
+        )
+        buffered_outlet = centered_outlet.buffer(
+            config.wall_thickness, join_style="round"
+        )
+        if not isinstance(buffered_outlet, Polygon):
+            raise GeometryError("The fan openings cannot be offset into a funnel wall.")
+        outlet_inner = _resample_boundary(
+            centered_outlet, count, preserve_corners=preserve_outlet_corners
+        )
+        outlet_outer = _resample_boundary(
+            buffered_outlet, count, outlet_inner[0], preserve_corners=False
+        )
+        outlet_radius = float(np.max(np.linalg.norm(outlet_outer, axis=1)))
+
+    base_center = np.array([center_2d[0], center_2d[1], top_z], dtype=float)
+    identity = np.eye(3, dtype=float)
+    warnings: list[str] = []
+
+    if not config.curved:
+        if config.length <= 0:
+            raise GeometryError("Funnel length must be greater than zero.")
+        segment_count = max(2, int(config.path_segments))
+        distances = np.linspace(-config.join_overlap, config.length, segment_count + 1)
+        shape_fractions = np.clip(distances / config.length, 0.0, 1.0)
+        centers = [
+            base_center
+            + np.array(
+                [
+                    config.offset_x * fraction,
+                    config.offset_y * fraction,
+                    distance,
+                ]
+            )
+            for distance, fraction in zip(distances, shape_fractions, strict=True)
+        ]
+        frames = [identity] * len(centers)
+        outlet_center = base_center + np.array(
+            [config.offset_x, config.offset_y, config.length], dtype=float
+        )
+        outlet_basis = identity
+        centerline_length = sqrt(
+            config.length**2 + config.offset_x**2 + config.offset_y**2
+        )
+    else:
+        if config.lead_in < 0 or config.lead_out < 0:
+            raise GeometryError("Curve lead lengths cannot be negative.")
+        component_magnitude = sqrt(config.angle_x**2 + config.angle_y**2)
+        if component_magnitude > 165.0:
+            raise GeometryError("The combined X/Y bend angle must be 165° or less.")
+        theta = radians(component_magnitude)
+        if component_magnitude < 1e-9:
+            horizontal = np.array([1.0, 0.0, 0.0])
+        else:
+            horizontal = np.array(
+                [config.angle_x / component_magnitude, config.angle_y / component_magnitude, 0.0]
+            )
+        axis = np.array([-horizontal[1], horizontal[0], 0.0], dtype=float)
+        outer_radius = outlet_radius
+        bend_radius = outer_radius + max(0.0, config.arc_diameter) / 2.0
+        arc_length = bend_radius * theta
+        total_length = config.lead_in + arc_length + config.lead_out
+        if total_length <= 0:
+            raise GeometryError("A curved funnel needs a bend angle or a lead length.")
+
+        segment_count = max(8, int(config.path_segments))
+        distances = np.linspace(-config.join_overlap, total_length, segment_count + 1)
+        bend_start = base_center + np.array([0.0, 0.0, config.lead_in])
+        bend_end = bend_start + bend_radius * (
+            sin(theta) * np.array([0.0, 0.0, 1.0])
+            + (1.0 - cos(theta)) * horizontal
+        )
+        final_direction = (
+            cos(theta) * np.array([0.0, 0.0, 1.0]) + sin(theta) * horizontal
+        )
+        centers = []
+        frames = []
+        for distance in distances:
+            if distance <= config.lead_in:
+                center = base_center + np.array([0.0, 0.0, distance])
+                local_angle = 0.0
+            elif distance < config.lead_in + arc_length and theta > 0:
+                local_angle = (distance - config.lead_in) / bend_radius
+                center = bend_start + bend_radius * (
+                    sin(local_angle) * np.array([0.0, 0.0, 1.0])
+                    + (1.0 - cos(local_angle)) * horizontal
+                )
+            else:
+                local_angle = theta
+                center = bend_end + final_direction * (
+                    distance - config.lead_in - arc_length
+                )
+            x_axis = _rodrigues(identity[:, 0], axis, local_angle)
+            y_axis = _rodrigues(identity[:, 1], axis, local_angle)
+            z_axis = _rodrigues(identity[:, 2], axis, local_angle)
+            centers.append(center)
+            frames.append(np.column_stack((x_axis, y_axis, z_axis)))
+        shape_fractions = np.clip(distances / total_length, 0.0, 1.0)
+        outlet_center = bend_end + final_direction * config.lead_out
+        outlet_basis = frames[-1]
+        centerline_length = total_length
+        if component_magnitude > 120:
+            warnings.append("Very large bend angles can be difficult to print without support.")
+
+    outer_rings: list[np.ndarray] = []
+    inner_rings: list[np.ndarray] = []
+    for fraction, center, basis in zip(shape_fractions, centers, frames, strict=True):
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        inner_2d = base_inner * (1.0 - fraction) + outlet_inner * fraction
+        outer_2d = base_outer * (1.0 - fraction) + outlet_outer * fraction
+        inner_3d = (
+            center
+            + inner_2d[:, 0, None] * basis[:, 0]
+            + inner_2d[:, 1, None] * basis[:, 1]
+        )
+        outer_3d = (
+            center
+            + outer_2d[:, 0, None] * basis[:, 0]
+            + outer_2d[:, 1, None] * basis[:, 1]
+        )
+        inner_rings.append(inner_3d)
+        outer_rings.append(outer_3d)
+
+    mesh = _mesh_from_rings(outer_rings, inner_rings)
+    return FunnelResult(mesh, outlet_center, outlet_basis, centerline_length, warnings)
+
+
 def make_funnel(
     opening: Polygon,
     top_z: float,
@@ -996,6 +1180,16 @@ def make_funnel(
     preserve_opening_corners: bool = True,
     preserve_outlet_corners: bool = True,
 ) -> FunnelResult:
+    if config.legacy_v03:
+        return _make_funnel_v03(
+            opening,
+            top_z,
+            config,
+            outlet_polygon=outlet_polygon,
+            inlet_outer_polygon=inlet_outer_polygon,
+            preserve_opening_corners=preserve_opening_corners,
+            preserve_outlet_corners=preserve_outlet_corners,
+        )
     if config.wall_thickness is None or config.wall_thickness <= 0:
         raise GeometryError("Wall thickness must be greater than zero.")
     if config.outlet_diameter <= 0:

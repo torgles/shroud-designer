@@ -1,11 +1,11 @@
-# Shroud Designer 0.3
+# Shroud Designer 0.4
 
 Shroud Designer turns an upright GPU connector STL into one print-ready, airtight shroud assembly. It detects the opening at the connector's highest Z layer, generates a straight/offset or compound-curved transition, adds a custom or imported fan connector, then fuses and validates the result before saving it as STL.
 
 ## Download — Linux
 
-Download `ShroudDesigner-0.3-linux-x86_64.tar.gz` from the
-[v0.3 release](https://github.com/torgles/shroud-designer/releases/tag/v0.3),
+Download `ShroudDesigner-0.4-linux-x86_64.tar.gz` from the
+[v0.4 release](https://github.com/torgles/shroud-designer/releases/tag/v0.4),
 extract it, then run:
 
 ```bash
@@ -36,6 +36,7 @@ Preview controls:
 - Straight offsets move the fan in X/Y without rotating it.
 - **Rounding starts at** defaults to 8 mm. Set it to 0 mm for immediate smoothing, or increase it to carry cable-access and other sharp connector features farther into the funnel. A longer preserved section may require a longer funnel to avoid an abrupt fan transition.
 - After rounding starts, recessed features are eased into the fan opening over the remaining funnel length. Where a recess closes, the outside leads the airway by at least the detected wall thickness so the resulting roof is printable instead of a zero-thickness seam.
+- **Use original 0.3 funnel loft** restores the direct point-to-point contour transition from commit `324ca88`, immediately before the 0.4 funnel work began. In this compatibility mode, **Rounding starts at** and 0.4 roof reinforcement are intentionally disabled.
 - Connector spacing is the clear edge-to-edge gap between the connector STL bounding boxes, not center-to-center spacing.
 - GPU split distance is measured from the GPU openings toward the shared transition. Fan split distance is measured back from the fan openings. Short collector chambers merge each set of airtight ducts into the main funnel.
 - GPU bridges can span the full connector Z length or only a configurable thickness at the front (maximum-Z funnel end) or back. Fan bridges span the full plate depth.
@@ -82,9 +83,9 @@ Produces:
 | Output | Description |
 |--------|-------------|
 | `dist/ShroudDesigner/ShroudDesigner` | Runnable app directory |
-| `dist/ShroudDesigner-0.3-linux-x86_64.tar.gz` | Distributable archive |
+| `dist/ShroudDesigner-0.4-linux-x86_64.tar.gz` | Distributable archive |
 | `Shroud Designer Linux/` | Portable folder with `install.sh` |
-| `public/ShroudDesigner-0.3-linux-x86_64.tar.gz` | Public release archive |
+| `public/ShroudDesigner-0.4-linux-x86_64.tar.gz` | Public release archive |
 
 Install for the current user:
 
@@ -101,7 +102,7 @@ See `linux/README.md` for portable-folder details.
 .\build.ps1
 ```
 
-Creates `dist\ShroudDesigner\ShroudDesigner.exe`, `dist\ShroudDesigner-0.3-Setup.exe`, `dist\ShroudDesigner-0.3-windows-x86_64.zip`, and Windows checksums.
+Creates `dist\ShroudDesigner\ShroudDesigner.exe`, `dist\ShroudDesigner-0.4-Setup.exe`, `dist\ShroudDesigner-0.4-windows-x86_64.zip`, and Windows checksums.
 
 ## License
 

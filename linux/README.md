@@ -1,6 +1,6 @@
 # Shroud Designer for Linux
 
-Portable Linux build of **Shroud Designer 0.3** (x86_64).
+Portable Linux build of **Shroud Designer 0.4** (x86_64).
 
 ## Quick install (current user)
 

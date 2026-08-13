@@ -1,3 +1,3 @@
-"""Shroud Designer 0.3."""
+"""Shroud Designer 0.4."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

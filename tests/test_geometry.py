@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from math import cos, radians, sin, sqrt
 from pathlib import Path
 
@@ -137,6 +138,57 @@ def test_funnel_automatically_traces_connector_top_rim(connector) -> None:
     assert FunnelConfig().wall_thickness is None
     assert np.all(np.min(distances, axis=1) < 1e-6)
     assert parts.funnel.is_watertight
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_signature"),
+    [
+        (
+            FunnelConfig(
+                length=37.0,
+                offset_x=11.0,
+                offset_y=-6.0,
+                radial_segments=96,
+                path_segments=31,
+                legacy_v03=True,
+            ),
+            "98421b6939fddf0785fb64d37aa01c42d65fa8ff72d33a918fc9931de30854e2",
+        ),
+        (
+            FunnelConfig(
+                curved=True,
+                angle_x=24.0,
+                angle_y=-13.0,
+                lead_in=17.0,
+                lead_out=21.0,
+                arc_diameter=54.0,
+                radial_segments=96,
+                path_segments=37,
+                legacy_v03=True,
+            ),
+            "aa0dff532e4cfe51dbb94321976ab2868940b87366f6cfd25c79b7074e064433",
+        ),
+    ],
+)
+def test_v03_mode_matches_pre_v04_geometry_exactly(
+    connector, config: FunnelConfig, expected_signature: str
+) -> None:
+    # These signatures were generated directly by make_funnel at commit
+    # 324ca88, immediately before the 0.4 funnel work began.
+    config.wall_thickness = connector.opening.wall_thickness
+    result = make_funnel(
+        connector.opening.polygon,
+        connector.top_z,
+        config,
+        inlet_outer_polygon=connector.outer_polygon,
+    )
+    signature = hashlib.sha256(
+        np.ascontiguousarray(result.mesh.vertices).tobytes()
+        + np.ascontiguousarray(result.mesh.faces).tobytes()
+    ).hexdigest()
+
+    assert result.mesh.is_watertight
+    assert signature == expected_signature
 
 
 def test_deep_slots_can_begin_smoothing_immediately_without_opening_the_wall() -> None:

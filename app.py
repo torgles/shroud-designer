@@ -58,6 +58,17 @@ def self_test(report_path: Path) -> int:
                 imported_fan=reference_fan,
             )
         )
+        v03_compatibility = union_assembly(
+            build_assembly_parts(
+                connector,
+                FunnelConfig(
+                    length=40.0,
+                    offset_x=8.0,
+                    legacy_v03=True,
+                ),
+                fan_config=FanConfig(),
+            )
+        )
         stacked = union_assembly(
             build_assembly_parts(
                 connector,
@@ -120,6 +131,11 @@ def self_test(report_path: Path) -> int:
                 "watertight": bool(curved.is_watertight),
                 "components": mesh_component_count(curved),
                 "triangles": len(curved.faces),
+            },
+            "v03_compatibility": {
+                "watertight": bool(v03_compatibility.is_watertight),
+                "components": mesh_component_count(v03_compatibility),
+                "triangles": len(v03_compatibility.faces),
             },
             "stacked": {
                 "connector_count": 4,

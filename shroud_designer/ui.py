@@ -7,6 +7,7 @@ from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QIcon, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -103,7 +104,7 @@ def _spin(
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Shroud Designer 0.3")
+        self.setWindowTitle("Shroud Designer 0.4")
         icon = app_icon_path()
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -142,7 +143,7 @@ class MainWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch()
-        version = QLabel("VERSION 0.3")
+        version = QLabel("VERSION 0.4")
         version.setObjectName("versionBadge")
         header_row.addWidget(version, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(header_row)
@@ -311,12 +312,20 @@ class MainWindow(QMainWindow):
         self.funnel_mode = _PanelComboBox()
         self.funnel_mode.addItem("Straight / offset", False)
         self.funnel_mode.addItem("Compound curve", True)
+        self.v03_mode = QCheckBox("Use original 0.3 funnel loft")
+        self.v03_mode.setChecked(
+            bool(self.settings.value("legacy_v03", False, type=bool))
+        )
+        self.v03_mode.setToolTip(
+            "Reproduces the direct point-to-point contour transition used immediately before version 0.4 development. Rounding-start and reinforced-roof behavior are disabled."
+        )
         self.rounding_start = _spin(0.0, 500.0, 8.0, decimals=1, step=1.0)
         self.rounding_start.setToolTip(
             "Height above the GPU connector that retains its exact top profile before smoothing begins. Use more clearance around power-cable openings; 0 mm rounds immediately."
         )
         common.addRow("Wall thickness", self.wall_info)
         common.addRow("Path", self.funnel_mode)
+        common.addRow("Compatibility", self.v03_mode)
         common.addRow("Rounding starts at", self.rounding_start)
         layout.addLayout(common)
 
@@ -408,6 +417,7 @@ class MainWindow(QMainWindow):
         self.fan_mode.currentIndexChanged.connect(self._fan_mode_changed)
         self.fan_size.currentIndexChanged.connect(self._fan_size_changed)
         self.funnel_mode.currentIndexChanged.connect(self._funnel_mode_changed)
+        self.v03_mode.toggled.connect(self._funnel_method_changed)
         self.connector_count.valueChanged.connect(self._connector_layout_changed)
         self.stack_axis.currentIndexChanged.connect(self._connector_layout_changed)
         self.connector_spacing.valueChanged.connect(self._connector_layout_changed)
@@ -576,6 +586,11 @@ class MainWindow(QMainWindow):
         self._update_mode_controls()
         self.schedule_preview()
 
+    def _funnel_method_changed(self, checked: bool) -> None:
+        self.settings.setValue("legacy_v03", checked)
+        self._update_mode_controls()
+        self.schedule_preview()
+
     def _update_mode_controls(self) -> None:
         imported = self.fan_mode.currentData() == "import"
         self.fan_file_widget.setVisible(imported)
@@ -583,6 +598,7 @@ class MainWindow(QMainWindow):
         curved = bool(self.funnel_mode.currentData())
         self.straight_widget.setEnabled(not curved)
         self.curve_widget.setEnabled(curved)
+        self.rounding_start.setEnabled(not self.v03_mode.isChecked())
         gpu_multiple = self.connector_count.value() > 1
         fan_multiple = self.fan_count.value() > 1
         self.stack_axis.setEnabled(gpu_multiple)
@@ -612,6 +628,7 @@ class MainWindow(QMainWindow):
             curved=bool(self.funnel_mode.currentData()),
             length=self.length.value(),
             rounding_start=self.rounding_start.value(),
+            legacy_v03=self.v03_mode.isChecked(),
             offset_x=self.offset_x.value(),
             offset_y=self.offset_y.value(),
             angle_x=self.angle_x.value(),
@@ -682,6 +699,7 @@ class MainWindow(QMainWindow):
                 f"• {self.connector_count.value()} GPU connector(s) "
                 f"• {self.fan_count.value()} fan(s) "
                 f"• {self.connector.opening.wall_thickness:.2f} mm auto wall "
+                f"• {'0.3 compatibility' if self.v03_mode.isChecked() else '0.4 reinforced'} "
                 f"• {len(parts.funnel.faces):,} funnel triangles"
             )
             if parts.funnel_result.warnings:
