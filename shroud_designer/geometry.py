@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from io import BytesIO
 from math import atan2, cos, pi, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterable
@@ -8,6 +9,7 @@ from typing import Iterable
 import numpy as np
 import trimesh
 import mapbox_earcut
+from manifold3d import Manifold, Mesh
 from shapely.affinity import translate as translate_polygon
 from shapely.geometry import Point, Polygon, box
 from shapely.geometry.polygon import orient
@@ -483,6 +485,132 @@ def _mesh_from_rings(outer_rings: list[np.ndarray], inner_rings: list[np.ndarray
     return mesh
 
 
+def _stable_polygon_points(polygon: Polygon) -> np.ndarray:
+    """Return a CCW contour with a repeatable seam on its right side."""
+    polygon = orient(polygon, sign=1.0)
+    points = np.asarray(polygon.exterior.coords[:-1], dtype=float)
+    center = np.asarray(polygon.centroid.coords[0], dtype=float)
+    scores = points[:, 0] - 0.001 * np.abs(points[:, 1] - center[1])
+    return np.roll(points, -int(np.argmax(scores)), axis=0)
+
+
+def _greedy_ring_strip(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Triangulate between ordered contours without forcing point-to-point pairs.
+
+    Concave features disappear while the GPU opening rounds. Pairing contour
+    point 37 to point 37 after that topology change can draw a face across the
+    duct. This zipper advances around whichever contour has the nearer next
+    point, preserving cyclic order even when the contours have different sizes.
+    """
+    lower_count, upper_count = len(lower), len(upper)
+    lower_index = upper_index = 0
+    faces: list[tuple[int, int, int]] = []
+    while lower_index < lower_count or upper_index < upper_count:
+        lower_point = lower[lower_index % lower_count]
+        upper_point = upper[upper_index % upper_count]
+        lower_cost = (
+            float(
+                np.sum(
+                    (lower[(lower_index + 1) % lower_count] - upper_point) ** 2
+                )
+            )
+            if lower_index < lower_count
+            else float("inf")
+        )
+        upper_cost = (
+            float(
+                np.sum(
+                    (lower_point - upper[(upper_index + 1) % upper_count]) ** 2
+                )
+            )
+            if upper_index < upper_count
+            else float("inf")
+        )
+        if lower_cost <= upper_cost:
+            faces.append(
+                (
+                    lower_index % lower_count,
+                    (lower_index + 1) % lower_count,
+                    lower_count + upper_index % upper_count,
+                )
+            )
+            lower_index += 1
+        else:
+            faces.append(
+                (
+                    lower_index % lower_count,
+                    lower_count + (upper_index + 1) % upper_count,
+                    lower_count + upper_index % upper_count,
+                )
+            )
+            upper_index += 1
+    return np.asarray(faces, dtype=np.int64)
+
+
+def _solid_from_cross_sections(
+    polygons: list[Polygon],
+    centers: list[np.ndarray],
+    frames: list[np.ndarray],
+    description: str,
+) -> trimesh.Trimesh:
+    """Create a filled, smoothly lofted solid through arbitrary simple contours."""
+    if not (len(polygons) == len(centers) == len(frames) and len(polygons) >= 2):
+        raise GeometryError(f"{description} needs matching cross-sections and path frames.")
+
+    rings: list[np.ndarray] = []
+    for polygon, center, basis in zip(polygons, centers, frames, strict=True):
+        points = _stable_polygon_points(polygon)
+        rings.append(
+            center
+            + points[:, 0, None] * basis[:, 0]
+            + points[:, 1, None] * basis[:, 1]
+        )
+
+    offsets: list[int] = []
+    vertex_count = 0
+    for ring in rings:
+        offsets.append(vertex_count)
+        vertex_count += len(ring)
+
+    faces: list[list[int]] = []
+    for section in range(len(rings) - 1):
+        lower = rings[section]
+        upper = rings[section + 1]
+        strip = _greedy_ring_strip(lower, upper)
+        lower_count = len(lower)
+        upper_mask = strip >= lower_count
+        strip[~upper_mask] += offsets[section]
+        strip[upper_mask] = (
+            strip[upper_mask] - lower_count + offsets[section + 1]
+        )
+        faces.extend(strip.tolist())
+
+    for section, reverse in ((0, True), (len(rings) - 1, False)):
+        # Earcut only needs coordinates in the section's own 2D frame. Use the
+        # original polygon points so curved/rotated world coordinates do not
+        # collapse when projected onto global XY.
+        local_points = _stable_polygon_points(polygons[section])
+        cap = mapbox_earcut.triangulate_float64(
+            np.asarray(local_points, dtype=np.float64),
+            np.asarray([len(local_points)], dtype=np.uint32),
+        ).reshape((-1, 3))
+        if reverse:
+            cap = cap[:, ::-1]
+        faces.extend((cap + offsets[section]).tolist())
+
+    mesh = trimesh.Trimesh(
+        vertices=np.concatenate(rings, axis=0),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=True,
+    )
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+    if not mesh.is_watertight or mesh_component_count(mesh) != 1:
+        raise GeometryError(f"{description} could not be lofted as one watertight solid.")
+    return mesh
+
+
 def _solid_loft(
     start: Polygon,
     start_z: float,
@@ -547,6 +675,30 @@ def _boolean_union(meshes: list[trimesh.Trimesh], description: str) -> trimesh.T
     if isinstance(result, trimesh.Scene):
         result = result.to_mesh()
     return result
+
+
+def _prepare_for_stl(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Retriangulate Boolean seams so float32 STL vertices remain closed."""
+    manifold = Manifold(
+        Mesh(
+            vert_properties=np.asarray(mesh.vertices, dtype=np.float32),
+            tri_verts=np.asarray(mesh.faces, dtype=np.uint32),
+        )
+    )
+    cleaned: trimesh.Trimesh | None = None
+    for tolerance in (1e-6, 1e-4, 1e-3, 3e-3, 1e-2):
+        manifold_mesh = manifold.simplify(tolerance).to_mesh()
+        candidate = trimesh.Trimesh(
+            vertices=manifold_mesh.vert_properties,
+            faces=manifold_mesh.tri_verts,
+            process=False,
+        )
+        candidate.remove_unreferenced_vertices()
+        cleaned = candidate
+        if not np.any(candidate.area_faces < 1e-10):
+            break
+    assert cleaned is not None
+    return cleaned
 
 
 def _validate_stack(
@@ -800,26 +952,25 @@ def make_funnel(
 
     count = max(32, int(config.radial_segments))
     center_2d = np.asarray(opening.centroid.coords[0], dtype=float)
-    base_inner_abs = _resample_boundary(
-        opening, count, preserve_corners=preserve_opening_corners
+    centered_opening = translate_polygon(
+        opening,
+        xoff=-float(center_2d[0]),
+        yoff=-float(center_2d[1]),
     )
-    base_outer_abs = _resample_boundary(
+    centered_outer = translate_polygon(
         buffered,
-        count,
-        base_inner_abs[0],
-        preserve_corners=inlet_outer_polygon is not None,
+        xoff=-float(center_2d[0]),
+        yoff=-float(center_2d[1]),
     )
-    base_inner = base_inner_abs - center_2d
-    base_outer = base_outer_abs - center_2d
+    base_inner = _resample_boundary(
+        centered_opening, count, preserve_corners=preserve_opening_corners
+    )
 
     if outlet_polygon is None:
         start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
         angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
         outlet_inner = np.column_stack((np.cos(angles), np.sin(angles))) * (
             config.outlet_diameter / 2.0
-        )
-        outlet_outer = np.column_stack((np.cos(angles), np.sin(angles))) * (
-            config.outlet_diameter / 2.0 + config.wall_thickness
         )
         outlet_radius = config.outlet_diameter / 2.0 + config.wall_thickness
     else:
@@ -838,10 +989,10 @@ def make_funnel(
         outlet_inner = _resample_boundary(
             centered_outlet, count, preserve_corners=preserve_outlet_corners
         )
-        outlet_outer = _resample_boundary(
+        outlet_outer_points = _resample_boundary(
             buffered_outlet, count, outlet_inner[0], preserve_corners=False
         )
-        outlet_radius = float(np.max(np.linalg.norm(outlet_outer, axis=1)))
+        outlet_radius = float(np.max(np.linalg.norm(outlet_outer_points, axis=1)))
 
     base_center = np.array([center_2d[0], center_2d[1], top_z], dtype=float)
     identity = np.eye(3, dtype=float)
@@ -851,7 +1002,23 @@ def make_funnel(
         if config.length <= 0:
             raise GeometryError("Funnel length must be greater than zero.")
         segment_count = max(2, int(config.path_segments))
+        centerline_length = sqrt(
+            config.length**2 + config.offset_x**2 + config.offset_y**2
+        )
+        concave_inlet = centered_opening.area < centered_opening.convex_hull.area * 0.995
+        smoothing_distance = (
+            min(config.length * 0.4, 8.0 * config.length / centerline_length)
+            if concave_inlet
+            else 0.0
+        )
         distances = np.linspace(-config.join_overlap, config.length, segment_count + 1)
+        if smoothing_distance > 1e-6:
+            smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
+            distances = np.unique(
+                np.concatenate(
+                    (distances, np.linspace(0.0, smoothing_distance, smoothing_steps + 1))
+                )
+            )
         shape_fractions = np.clip(distances / config.length, 0.0, 1.0)
         centers = [
             base_center
@@ -869,9 +1036,6 @@ def make_funnel(
             [config.offset_x, config.offset_y, config.length], dtype=float
         )
         outlet_basis = identity
-        centerline_length = sqrt(
-            config.length**2 + config.offset_x**2 + config.offset_y**2
-        )
     else:
         if config.lead_in < 0 or config.lead_out < 0:
             raise GeometryError("Curve lead lengths cannot be negative.")
@@ -896,7 +1060,16 @@ def make_funnel(
             raise GeometryError("A curved funnel needs a bend angle or a lead length.")
 
         segment_count = max(8, int(config.path_segments))
+        concave_inlet = centered_opening.area < centered_opening.convex_hull.area * 0.995
+        smoothing_distance = min(total_length * 0.4, 8.0) if concave_inlet else 0.0
         distances = np.linspace(-config.join_overlap, total_length, segment_count + 1)
+        if smoothing_distance > 1e-6:
+            smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
+            distances = np.unique(
+                np.concatenate(
+                    (distances, np.linspace(0.0, smoothing_distance, smoothing_steps + 1))
+                )
+            )
         bend_start = base_center + np.array([0.0, 0.0, config.lead_in])
         bend_end = bend_start + bend_radius * (
             sin(theta) * np.array([0.0, 0.0, 1.0])
@@ -934,26 +1107,100 @@ def make_funnel(
         if component_magnitude > 120:
             warnings.append("Very large bend angles can be difficult to print without support.")
 
-    outer_rings: list[np.ndarray] = []
-    inner_rings: list[np.ndarray] = []
-    for fraction, center, basis in zip(shape_fractions, centers, frames, strict=True):
-        fraction = float(np.clip(fraction, 0.0, 1.0))
-        inner_2d = base_inner * (1.0 - fraction) + outlet_inner * fraction
-        outer_2d = base_outer * (1.0 - fraction) + outlet_outer * fraction
-        inner_3d = (
-            center
-            + inner_2d[:, 0, None] * basis[:, 0]
-            + inner_2d[:, 1, None] * basis[:, 1]
-        )
-        outer_3d = (
-            center
-            + outer_2d[:, 0, None] * basis[:, 0]
-            + outer_2d[:, 1, None] * basis[:, 1]
-        )
-        inner_rings.append(inner_3d)
-        outer_rings.append(outer_3d)
+    smoothing_fraction = (
+        smoothing_distance / (config.length if not config.curved else total_length)
+        if smoothing_distance > 1e-9
+        else 0.0
+    )
+    rounded_inlet = orient(centered_opening.convex_hull, sign=1.0)
+    rounded_inlet_points = _resample_boundary(
+        rounded_inlet,
+        count,
+        base_inner[0],
+        preserve_corners=True,
+    )
+    min_x, min_y, max_x, max_y = centered_opening.bounds
+    closing_radius = max(max_x - min_x, max_y - min_y)
 
-    mesh = _mesh_from_rings(outer_rings, inner_rings)
+    inner_sections: list[Polygon] = []
+    outer_sections: list[Polygon] = []
+    for fraction in shape_fractions:
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        if smoothing_fraction > 0.0 and fraction < smoothing_fraction:
+            progress = fraction / smoothing_fraction
+            if progress <= 1e-9:
+                inner_section = centered_opening
+            else:
+                # Begin rounding on the first section, but ramp the offset so a
+                # narrow slot closes across several nearby contours instead of
+                # disappearing in one large jump.
+                distance = closing_radius * progress**2
+                inner_section = centered_opening.buffer(
+                    distance, join_style="round"
+                ).buffer(-distance, join_style="round")
+                if not isinstance(inner_section, Polygon) or inner_section.is_empty:
+                    raise GeometryError("The connector opening could not be rounded safely.")
+        else:
+            outlet_progress = (
+                (fraction - smoothing_fraction) / (1.0 - smoothing_fraction)
+                if smoothing_fraction > 0.0
+                else fraction
+            )
+            outlet_progress = float(np.clip(outlet_progress, 0.0, 1.0))
+            outlet_progress = 1.0 - (1.0 - outlet_progress) ** 2
+            inlet_points = rounded_inlet_points if smoothing_fraction > 0.0 else base_inner
+            inner_section = Polygon(
+                inlet_points * (1.0 - outlet_progress)
+                + outlet_inner * outlet_progress
+            )
+        inner_section = orient(inner_section, sign=1.0)
+        if not inner_section.is_valid:
+            raise GeometryError(
+                "The funnel airflow path intersects itself. Increase the funnel length or use gentler settings."
+            )
+        outer_section = (
+            centered_outer
+            if fraction <= 1e-12
+            else inner_section.buffer(config.wall_thickness, join_style="round")
+        )
+        if not isinstance(outer_section, Polygon) or not outer_section.is_valid:
+            raise GeometryError("The funnel wall could not be offset from its airflow path.")
+        if not outer_section.buffer(1e-7).covers(inner_section):
+            raise GeometryError("The funnel wall does not contain its airflow path.")
+        inner_sections.append(inner_section)
+        outer_sections.append(orient(outer_section, sign=1.0))
+
+    outer_solid = _solid_from_cross_sections(
+        outer_sections, centers, frames, "The outside of the funnel"
+    )
+    airway_extension = max(1.0, config.wall_thickness)
+    inner_centers = [
+        centers[0] - frames[0][:, 2] * airway_extension,
+        *centers,
+        centers[-1] + frames[-1][:, 2] * airway_extension,
+    ]
+    inner_frames = [frames[0], *frames, frames[-1]]
+    inner_solid = _solid_from_cross_sections(
+        [inner_sections[0], *inner_sections, inner_sections[-1]],
+        inner_centers,
+        inner_frames,
+        "The funnel airflow passage",
+    )
+    try:
+        mesh = trimesh.boolean.difference(
+            [outer_solid, inner_solid], engine="manifold", check_volume=False
+        )
+    except Exception as exc:
+        raise GeometryError(f"Could not hollow the funnel: {exc}") from exc
+    if mesh is None:
+        raise GeometryError("Could not hollow the funnel.")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+    mesh.remove_unreferenced_vertices()
+    if not mesh.is_winding_consistent:
+        mesh.fix_normals()
+    if not mesh.is_watertight or mesh_component_count(mesh) != 1:
+        raise GeometryError("The generated funnel is not one watertight solid.")
     return FunnelResult(mesh, outlet_center, outlet_basis, centerline_length, warnings)
 
 
@@ -1244,7 +1491,7 @@ def union_assembly(parts: AssemblyParts) -> trimesh.Trimesh:
         raise GeometryError("The assembly parts could not be fused into one solid.")
     if isinstance(result, trimesh.Scene):
         result = result.to_mesh()
-    result.remove_unreferenced_vertices()
+    result = _prepare_for_stl(result)
     if not result.is_winding_consistent:
         result.fix_normals()
     if not result.is_watertight:
@@ -1291,5 +1538,21 @@ def mesh_component_count(mesh: trimesh.Trimesh) -> int:
 
 def export_stl(parts: AssemblyParts, path: str | Path) -> trimesh.Trimesh:
     result = union_assembly(parts)
-    result.export(Path(path), file_type="stl")
-    return result
+    payload = result.export(file_type="stl")
+    verified = trimesh.load(
+        file_obj=BytesIO(payload),
+        file_type="stl",
+        force="mesh",
+        process=True,
+    )
+    if isinstance(verified, trimesh.Scene):
+        verified = verified.to_mesh()
+    if (
+        not isinstance(verified, trimesh.Trimesh)
+        or not verified.is_watertight
+        or mesh_component_count(verified) != 1
+        or np.any(verified.area_faces < 1e-10)
+    ):
+        raise GeometryError("The STL changed during serialization and was not saved.")
+    Path(path).write_bytes(payload)
+    return verified

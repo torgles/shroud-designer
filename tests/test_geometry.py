@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 from shapely.geometry import Polygon
 
 from shroud_designer.geometry import (
@@ -18,10 +19,11 @@ from shroud_designer.geometry import (
     build_assembly_parts,
     export_stl,
     make_custom_fan,
+    make_funnel,
     mesh_component_count,
     union_assembly,
 )
-from shroud_designer.geometry import _resample_boundary
+from shroud_designer.geometry import _resample_boundary, _slice_polygons
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +95,48 @@ def test_funnel_automatically_traces_connector_top_rim(connector) -> None:
     assert FunnelConfig().wall_thickness is None
     assert np.all(np.min(distances, axis=1) < 1e-6)
     assert parts.funnel.is_watertight
+
+
+def test_deep_slots_begin_smoothing_immediately_without_opening_the_wall() -> None:
+    opening = Polygon(
+        [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 80.0),
+            (72.0, 80.0),
+            (72.0, 34.0),
+            (61.0, 34.0),
+            (61.0, 80.0),
+            (39.0, 80.0),
+            (39.0, 34.0),
+            (28.0, 34.0),
+            (28.0, 80.0),
+            (0.0, 80.0),
+        ]
+    )
+    result = make_funnel(
+        opening,
+        0.0,
+        FunnelConfig(
+            wall_thickness=2.0,
+            length=25.0,
+            radial_segments=96,
+            path_segments=48,
+        ),
+        inlet_outer_polygon=opening.buffer(2.0, join_style="round"),
+    )
+
+    assert result.mesh.is_watertight
+    assert mesh_component_count(result.mesh) == 1
+    first_airway_area: float | None = None
+    for height in (0.05, 0.21, 0.5, 1.0, 2.0, 4.0, 6.0, 7.9):
+        contours = _slice_polygons(result.mesh, height)
+        assert len(contours) == 2
+        assert contours[0].contains(contours[1])
+        if height == 0.5:
+            first_airway_area = contours[1].area
+    assert first_airway_area is not None
+    assert first_airway_area > opening.area
 
 
 def test_reference_fan_measurements() -> None:
@@ -183,6 +227,10 @@ def test_exports_binary_stl(connector, tmp_path: Path) -> None:
     assert target.is_file()
     assert target.stat().st_size > 1_000
     assert result.is_watertight
+    reloaded = trimesh.load(target, force="mesh", process=True)
+    assert reloaded.is_watertight
+    assert mesh_component_count(reloaded) == 1
+    assert not np.any(reloaded.area_faces < 1e-10)
     # Binary STL: 80-byte header, uint32 triangle count, then 50 bytes per triangle.
     assert target.stat().st_size == 84 + len(result.faces) * 50
 
