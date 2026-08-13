@@ -97,7 +97,7 @@ def test_funnel_automatically_traces_connector_top_rim(connector) -> None:
     assert parts.funnel.is_watertight
 
 
-def test_deep_slots_begin_smoothing_immediately_without_opening_the_wall() -> None:
+def test_deep_slots_can_begin_smoothing_immediately_without_opening_the_wall() -> None:
     opening = Polygon(
         [
             (0.0, 0.0),
@@ -120,6 +120,7 @@ def test_deep_slots_begin_smoothing_immediately_without_opening_the_wall() -> No
         FunnelConfig(
             wall_thickness=2.0,
             length=25.0,
+            rounding_start=0.0,
             radial_segments=96,
             path_segments=48,
         ),
@@ -137,6 +138,44 @@ def test_deep_slots_begin_smoothing_immediately_without_opening_the_wall() -> No
             first_airway_area = contours[1].area
     assert first_airway_area is not None
     assert first_airway_area > opening.area
+
+
+def test_rounding_start_preserves_cable_access_profile_before_transition() -> None:
+    opening = Polygon(
+        [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 80.0),
+            (72.0, 80.0),
+            (72.0, 34.0),
+            (61.0, 34.0),
+            (61.0, 80.0),
+            (39.0, 80.0),
+            (39.0, 34.0),
+            (28.0, 34.0),
+            (28.0, 80.0),
+            (0.0, 80.0),
+        ]
+    )
+    result = make_funnel(
+        opening,
+        0.0,
+        FunnelConfig(
+            wall_thickness=2.0,
+            length=30.0,
+            rounding_start=8.0,
+            radial_segments=96,
+            path_segments=48,
+        ),
+        inlet_outer_polygon=opening.buffer(2.0, join_style="round"),
+    )
+
+    before = _slice_polygons(result.mesh, 7.5)
+    after = _slice_polygons(result.mesh, 9.5)
+    assert len(before) == 2
+    assert len(after) == 2
+    assert before[1].area == pytest.approx(opening.area, abs=1.0)
+    assert after[1].area > before[1].area + 1.0
 
 
 def test_reference_fan_measurements() -> None:

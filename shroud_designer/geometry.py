@@ -63,6 +63,7 @@ class FunnelConfig:
     wall_thickness: float | None = None
     curved: bool = False
     length: float = 50.0
+    rounding_start: float = 8.0
     offset_x: float = 0.0
     offset_y: float = 0.0
     angle_x: float = 0.0
@@ -557,9 +558,11 @@ def _solid_from_cross_sections(
     if not (len(polygons) == len(centers) == len(frames) and len(polygons) >= 2):
         raise GeometryError(f"{description} needs matching cross-sections and path frames.")
 
+    local_rings: list[np.ndarray] = []
     rings: list[np.ndarray] = []
     for polygon, center, basis in zip(polygons, centers, frames, strict=True):
         points = _stable_polygon_points(polygon)
+        local_rings.append(points)
         rings.append(
             center
             + points[:, 0, None] * basis[:, 0]
@@ -576,7 +579,24 @@ def _solid_from_cross_sections(
     for section in range(len(rings) - 1):
         lower = rings[section]
         upper = rings[section + 1]
-        strip = _greedy_ring_strip(lower, upper)
+        lower_local = local_rings[section]
+        upper_local = local_rings[section + 1]
+        if len(lower_local) == len(upper_local) and np.allclose(
+            lower_local, upper_local, atol=1e-9
+        ):
+            point_count = len(lower_local)
+            strip_faces: list[list[int]] = []
+            for point in range(point_count):
+                next_point = (point + 1) % point_count
+                strip_faces.extend(
+                    [
+                        [point, next_point, point_count + next_point],
+                        [point, point_count + next_point, point_count + point],
+                    ]
+                )
+            strip = np.asarray(strip_faces, dtype=np.int64)
+        else:
+            strip = _greedy_ring_strip(lower, upper)
         lower_count = len(lower)
         upper_mask = strip >= lower_count
         strip[~upper_mask] += offsets[section]
@@ -601,13 +621,18 @@ def _solid_from_cross_sections(
     mesh = trimesh.Trimesh(
         vertices=np.concatenate(rings, axis=0),
         faces=np.asarray(faces, dtype=np.int64),
-        process=True,
+        process=False,
     )
     mesh.remove_unreferenced_vertices()
     if not mesh.is_winding_consistent:
         mesh.fix_normals()
     if not mesh.is_watertight or mesh_component_count(mesh) != 1:
-        raise GeometryError(f"{description} could not be lofted as one watertight solid.")
+        edge_uses = np.bincount(mesh.edges_unique_inverse)
+        bad_edges = int(np.count_nonzero(edge_uses != 2))
+        raise GeometryError(
+            f"{description} could not be lofted as one watertight solid "
+            f"({bad_edges} unmatched edges, {len(mesh.faces)} faces)."
+        )
     return mesh
 
 
@@ -938,6 +963,8 @@ def make_funnel(
         raise GeometryError("Wall thickness must be greater than zero.")
     if config.outlet_diameter <= 0:
         raise GeometryError("Fan hole diameter must be greater than zero.")
+    if config.rounding_start < 0:
+        raise GeometryError("Rounding start cannot be negative.")
 
     opening = orient(opening, sign=1.0)
     buffered = (
@@ -966,6 +993,7 @@ def make_funnel(
         centered_opening, count, preserve_corners=preserve_opening_corners
     )
 
+    exact_outlet: Polygon | None = None
     if outlet_polygon is None:
         start_angle = atan2(base_inner[0, 1], base_inner[0, 0])
         angles = start_angle + np.arange(count, dtype=float) * 2.0 * pi / count
@@ -981,6 +1009,7 @@ def make_funnel(
             xoff=-float(outlet_center_2d[0]),
             yoff=-float(outlet_center_2d[1]),
         )
+        exact_outlet = centered_outlet
         buffered_outlet = centered_outlet.buffer(
             config.wall_thickness, join_style="round"
         )
@@ -1006,17 +1035,35 @@ def make_funnel(
             config.length**2 + config.offset_x**2 + config.offset_y**2
         )
         concave_inlet = centered_opening.area < centered_opening.convex_hull.area * 0.995
+        rounding_start = config.rounding_start if concave_inlet else 0.0
+        if concave_inlet and rounding_start >= centerline_length - 1.0:
+            raise GeometryError(
+                "Rounding must start at least 1 mm before the fan. Increase the funnel length or reduce Rounding starts at."
+            )
+        available_after_start = centerline_length - rounding_start
         smoothing_distance = (
-            min(config.length * 0.4, 8.0 * config.length / centerline_length)
-            if concave_inlet
-            else 0.0
+            min(8.0, available_after_start * 0.5) if concave_inlet else 0.0
+        )
+        start_distance = rounding_start * config.length / centerline_length
+        smoothing_end_distance = (
+            (rounding_start + smoothing_distance)
+            * config.length
+            / centerline_length
         )
         distances = np.linspace(-config.join_overlap, config.length, segment_count + 1)
         if smoothing_distance > 1e-6:
             smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
             distances = np.unique(
                 np.concatenate(
-                    (distances, np.linspace(0.0, smoothing_distance, smoothing_steps + 1))
+                    (
+                        distances,
+                        np.asarray([start_distance]),
+                        np.linspace(
+                            start_distance,
+                            smoothing_end_distance,
+                            smoothing_steps + 1,
+                        ),
+                    )
                 )
             )
         shape_fractions = np.clip(distances / config.length, 0.0, 1.0)
@@ -1061,13 +1108,29 @@ def make_funnel(
 
         segment_count = max(8, int(config.path_segments))
         concave_inlet = centered_opening.area < centered_opening.convex_hull.area * 0.995
-        smoothing_distance = min(total_length * 0.4, 8.0) if concave_inlet else 0.0
+        rounding_start = config.rounding_start if concave_inlet else 0.0
+        if concave_inlet and rounding_start >= total_length - 1.0:
+            raise GeometryError(
+                "Rounding must start at least 1 mm before the fan. Increase the curved path length or reduce Rounding starts at."
+            )
+        available_after_start = total_length - rounding_start
+        smoothing_distance = (
+            min(8.0, available_after_start * 0.5) if concave_inlet else 0.0
+        )
         distances = np.linspace(-config.join_overlap, total_length, segment_count + 1)
         if smoothing_distance > 1e-6:
             smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
             distances = np.unique(
                 np.concatenate(
-                    (distances, np.linspace(0.0, smoothing_distance, smoothing_steps + 1))
+                    (
+                        distances,
+                        np.asarray([rounding_start]),
+                        np.linspace(
+                            rounding_start,
+                            rounding_start + smoothing_distance,
+                            smoothing_steps + 1,
+                        ),
+                    )
                 )
             )
         bend_start = base_center + np.array([0.0, 0.0, config.lead_in])
@@ -1107,27 +1170,47 @@ def make_funnel(
         if component_magnitude > 120:
             warnings.append("Very large bend angles can be difficult to print without support.")
 
-    smoothing_fraction = (
-        smoothing_distance / (config.length if not config.curved else total_length)
-        if smoothing_distance > 1e-9
-        else 0.0
+    path_length = centerline_length if not config.curved else total_length
+    rounding_start_fraction = (
+        rounding_start / centerline_length
+        if not config.curved
+        else rounding_start / total_length
     )
-    rounded_inlet = orient(centered_opening.convex_hull, sign=1.0)
+    smoothing_end_fraction = (
+        (rounding_start + smoothing_distance)
+        / (centerline_length if not config.curved else total_length)
+        if smoothing_distance > 1e-9
+        else rounding_start_fraction
+    )
+    min_x, min_y, max_x, max_y = centered_opening.bounds
+    closing_radius = max(max_x - min_x, max_y - min_y)
+    rounded_inlet = centered_opening.buffer(
+        closing_radius, join_style="round"
+    ).buffer(-closing_radius, join_style="round")
+    if not isinstance(rounded_inlet, Polygon) or rounded_inlet.is_empty:
+        raise GeometryError("The connector opening could not be rounded safely.")
+    rounded_inlet = orient(rounded_inlet, sign=1.0)
     rounded_inlet_points = _resample_boundary(
         rounded_inlet,
         count,
         base_inner[0],
         preserve_corners=True,
     )
-    min_x, min_y, max_x, max_y = centered_opening.bounds
-    closing_radius = max(max_x - min_x, max_y - min_y)
-
     inner_sections: list[Polygon] = []
     outer_sections: list[Polygon] = []
     for fraction in shape_fractions:
         fraction = float(np.clip(fraction, 0.0, 1.0))
-        if smoothing_fraction > 0.0 and fraction < smoothing_fraction:
-            progress = fraction / smoothing_fraction
+        if exact_outlet is not None and fraction >= 1.0 - 1e-12:
+            # Preserve the fan's exact hole contour at the join. Resampling that
+            # last ring makes almost-coincident chords which Boolean into tiny
+            # slivers and can become slicer warnings after STL conversion.
+            inner_section = exact_outlet
+        elif fraction <= rounding_start_fraction + 1e-12:
+            inner_section = centered_opening
+        elif smoothing_distance > 0.0 and fraction < smoothing_end_fraction:
+            progress = (fraction - rounding_start_fraction) / (
+                smoothing_end_fraction - rounding_start_fraction
+            )
             if progress <= 1e-9:
                 inner_section = centered_opening
             else:
@@ -1142,13 +1225,13 @@ def make_funnel(
                     raise GeometryError("The connector opening could not be rounded safely.")
         else:
             outlet_progress = (
-                (fraction - smoothing_fraction) / (1.0 - smoothing_fraction)
-                if smoothing_fraction > 0.0
+                (fraction - smoothing_end_fraction) / (1.0 - smoothing_end_fraction)
+                if smoothing_distance > 0.0
                 else fraction
             )
             outlet_progress = float(np.clip(outlet_progress, 0.0, 1.0))
             outlet_progress = 1.0 - (1.0 - outlet_progress) ** 2
-            inlet_points = rounded_inlet_points if smoothing_fraction > 0.0 else base_inner
+            inlet_points = rounded_inlet_points if smoothing_distance > 0.0 else base_inner
             inner_section = Polygon(
                 inlet_points * (1.0 - outlet_progress)
                 + outlet_inner * outlet_progress
@@ -1160,7 +1243,7 @@ def make_funnel(
             )
         outer_section = (
             centered_outer
-            if fraction <= 1e-12
+            if fraction <= rounding_start_fraction + 1e-12
             else inner_section.buffer(config.wall_thickness, join_style="round")
         )
         if not isinstance(outer_section, Polygon) or not outer_section.is_valid:
@@ -1169,6 +1252,12 @@ def make_funnel(
             raise GeometryError("The funnel wall does not contain its airflow path.")
         inner_sections.append(inner_section)
         outer_sections.append(orient(outer_section, sign=1.0))
+
+    remaining_after_rounding = path_length * (1.0 - smoothing_end_fraction)
+    if concave_inlet and remaining_after_rounding < 8.0:
+        warnings.append(
+            f"Only {remaining_after_rounding:.1f} mm remains after inlet rounding; increase the path length for a gentler fan transition."
+        )
 
     outer_solid = _solid_from_cross_sections(
         outer_sections, centers, frames, "The outside of the funnel"

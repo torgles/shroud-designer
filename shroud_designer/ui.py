@@ -311,8 +311,13 @@ class MainWindow(QMainWindow):
         self.funnel_mode = _PanelComboBox()
         self.funnel_mode.addItem("Straight / offset", False)
         self.funnel_mode.addItem("Compound curve", True)
+        self.rounding_start = _spin(0.0, 500.0, 8.0, decimals=1, step=1.0)
+        self.rounding_start.setToolTip(
+            "Height above the GPU connector that retains its exact top profile before smoothing begins. Use more clearance around power-cable openings; 0 mm rounds immediately."
+        )
         common.addRow("Wall thickness", self.wall_info)
         common.addRow("Path", self.funnel_mode)
+        common.addRow("Rounding starts at", self.rounding_start)
         layout.addLayout(common)
 
         self.split_widget = QGroupBox("Split settings")
@@ -414,6 +419,7 @@ class MainWindow(QMainWindow):
         for control in (
             self.fan_hole,
             self.screw_hole,
+            self.rounding_start,
             self.length,
             self.offset_x,
             self.offset_y,
@@ -605,6 +611,7 @@ class MainWindow(QMainWindow):
         funnel = FunnelConfig(
             curved=bool(self.funnel_mode.currentData()),
             length=self.length.value(),
+            rounding_start=self.rounding_start.value(),
             offset_x=self.offset_x.value(),
             offset_y=self.offset_y.value(),
             angle_x=self.angle_x.value(),
