@@ -9,6 +9,7 @@ from typing import Iterable
 import numpy as np
 import trimesh
 import mapbox_earcut
+import shapely
 from manifold3d import Manifold, Mesh
 from shapely.affinity import translate as translate_polygon
 from shapely.geometry import Point, Polygon, box
@@ -548,6 +549,42 @@ def _greedy_ring_strip(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
     return np.asarray(faces, dtype=np.int64)
 
 
+def _smoothstep(progress: float) -> float:
+    progress = float(np.clip(progress, 0.0, 1.0))
+    return progress * progress * (3.0 - 2.0 * progress)
+
+
+def _select_valid_morph_target(
+    source: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    """Choose a cyclic outlet correspondence whose entire morph stays simple."""
+    if len(source) != len(target):
+        raise GeometryError("The inlet and outlet contours need matching samples.")
+    candidates = sorted(
+        range(len(target)),
+        key=lambda shift: float(
+            np.sum((source - np.roll(target, shift, axis=0)) ** 2)
+        ),
+    )
+    # Self-intersection windows can be much narrower than the preview's path
+    # spacing when a connector has deep, closely spaced slots. Shapely's array
+    # operations make a dense check inexpensive and prevent a correspondence
+    # that only appears valid at the generated cross-sections.
+    progress = np.linspace(0.0, 1.0, 8193)
+    for shift in candidates:
+        shifted = np.roll(target, shift, axis=0)
+        coordinates = (
+            source[None, :, :] * (1.0 - progress[:, None, None])
+            + shifted[None, :, :] * progress[:, None, None]
+        )
+        if bool(np.all(shapely.is_valid(shapely.polygons(coordinates)))):
+            return shifted
+    raise GeometryError(
+        "The connector cannot transition to this fan opening without crossing itself. Increase the funnel length or choose another top opening."
+    )
+
+
 def _solid_from_cross_sections(
     polygons: list[Polygon],
     centers: list[np.ndarray],
@@ -1041,27 +1078,31 @@ def make_funnel(
                 "Rounding must start at least 1 mm before the fan. Increase the funnel length or reduce Rounding starts at."
             )
         available_after_start = centerline_length - rounding_start
-        smoothing_distance = (
-            min(8.0, available_after_start * 0.5) if concave_inlet else 0.0
+        conditioning_length = (
+            min(
+                max(6.0, config.wall_thickness * 3.0),
+                available_after_start * 0.35,
+            )
+            if concave_inlet
+            else 0.0
         )
         start_distance = rounding_start * config.length / centerline_length
-        smoothing_end_distance = (
-            (rounding_start + smoothing_distance)
+        conditioning_end_distance = (
+            (rounding_start + conditioning_length)
             * config.length
             / centerline_length
         )
         distances = np.linspace(-config.join_overlap, config.length, segment_count + 1)
-        if smoothing_distance > 1e-6:
-            smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
+        if concave_inlet:
+            conditioning_steps = max(2, int(np.ceil(conditioning_length / 0.25)))
             distances = np.unique(
                 np.concatenate(
                     (
                         distances,
-                        np.asarray([start_distance]),
                         np.linspace(
                             start_distance,
-                            smoothing_end_distance,
-                            smoothing_steps + 1,
+                            conditioning_end_distance,
+                            conditioning_steps + 1,
                         ),
                     )
                 )
@@ -1114,21 +1155,25 @@ def make_funnel(
                 "Rounding must start at least 1 mm before the fan. Increase the curved path length or reduce Rounding starts at."
             )
         available_after_start = total_length - rounding_start
-        smoothing_distance = (
-            min(8.0, available_after_start * 0.5) if concave_inlet else 0.0
+        conditioning_length = (
+            min(
+                max(6.0, config.wall_thickness * 3.0),
+                available_after_start * 0.35,
+            )
+            if concave_inlet
+            else 0.0
         )
         distances = np.linspace(-config.join_overlap, total_length, segment_count + 1)
-        if smoothing_distance > 1e-6:
-            smoothing_steps = max(2, int(np.ceil(smoothing_distance / 0.2)))
+        if concave_inlet:
+            conditioning_steps = max(2, int(np.ceil(conditioning_length / 0.25)))
             distances = np.unique(
                 np.concatenate(
                     (
                         distances,
-                        np.asarray([rounding_start]),
                         np.linspace(
                             rounding_start,
-                            rounding_start + smoothing_distance,
-                            smoothing_steps + 1,
+                            rounding_start + conditioning_length,
+                            conditioning_steps + 1,
                         ),
                     )
                 )
@@ -1176,87 +1221,129 @@ def make_funnel(
         if not config.curved
         else rounding_start / total_length
     )
-    smoothing_end_fraction = (
-        (rounding_start + smoothing_distance)
-        / (centerline_length if not config.curved else total_length)
-        if smoothing_distance > 1e-9
+    min_x, min_y, max_x, max_y = centered_opening.bounds
+    minimum_extent = min(max_x - min_x, max_y - min_y)
+    # Raw CAD rims can have deep slots whose vertices cannot move directly to
+    # a circle without crossing. Gently round roughly two wall thicknesses of
+    # small detail first, increasing only if the complete morph still crosses.
+    conditioning_radius = (
+        min(
+            max(4.0, config.wall_thickness * 2.0),
+            minimum_extent * 0.2,
+        )
+        if concave_inlet
+        else 0.0
+    )
+    conditioned_inlet = centered_opening
+    conditioned_points = base_inner
+    morph_error: GeometryError | None = None
+    for _ in range(6):
+        if conditioning_radius > 1e-9:
+            candidate = centered_opening.buffer(
+                conditioning_radius, join_style="round"
+            ).buffer(-conditioning_radius, join_style="round")
+            if not isinstance(candidate, Polygon) or candidate.is_empty:
+                raise GeometryError("The connector opening could not be rounded safely.")
+            conditioned_inlet = orient(candidate, sign=1.0)
+            conditioned_points = _resample_boundary(
+                conditioned_inlet,
+                count,
+                preserve_corners=False,
+            )
+        try:
+            outlet_inner = _select_valid_morph_target(
+                conditioned_points, outlet_inner
+            )
+            morph_error = None
+            break
+        except GeometryError as exc:
+            morph_error = exc
+            if not concave_inlet:
+                break
+            conditioning_radius = min(
+                conditioning_radius * 1.5,
+                minimum_extent * 0.45,
+            )
+    if morph_error is not None:
+        raise morph_error
+
+    conditioning_end_fraction = (
+        rounding_start_fraction + conditioning_length / path_length
+        if concave_inlet
         else rounding_start_fraction
     )
-    min_x, min_y, max_x, max_y = centered_opening.bounds
-    closing_radius = max(max_x - min_x, max_y - min_y)
-    rounded_inlet = centered_opening.buffer(
-        closing_radius, join_style="round"
-    ).buffer(-closing_radius, join_style="round")
-    if not isinstance(rounded_inlet, Polygon) or rounded_inlet.is_empty:
-        raise GeometryError("The connector opening could not be rounded safely.")
-    rounded_inlet = orient(rounded_inlet, sign=1.0)
-    rounded_inlet_points = _resample_boundary(
-        rounded_inlet,
-        count,
-        base_inner[0],
-        preserve_corners=True,
-    )
-    inner_sections: list[Polygon] = []
-    outer_sections: list[Polygon] = []
-    for fraction in shape_fractions:
+
+    def morph_section(fraction: float) -> Polygon:
         fraction = float(np.clip(fraction, 0.0, 1.0))
         if exact_outlet is not None and fraction >= 1.0 - 1e-12:
-            # Preserve the fan's exact hole contour at the join. Resampling that
-            # last ring makes almost-coincident chords which Boolean into tiny
-            # slivers and can become slicer warnings after STL conversion.
-            inner_section = exact_outlet
-        elif fraction <= rounding_start_fraction + 1e-12:
-            inner_section = centered_opening
-        elif smoothing_distance > 0.0 and fraction < smoothing_end_fraction:
+            return exact_outlet
+        if fraction <= rounding_start_fraction + 1e-12:
+            return centered_opening
+        if (
+            concave_inlet
+            and fraction < conditioning_end_fraction - 1e-12
+        ):
             progress = (fraction - rounding_start_fraction) / (
-                smoothing_end_fraction - rounding_start_fraction
+                conditioning_end_fraction - rounding_start_fraction
             )
-            if progress <= 1e-9:
-                inner_section = centered_opening
-            else:
-                # Begin rounding on the first section, but ramp the offset so a
-                # narrow slot closes across several nearby contours instead of
-                # disappearing in one large jump.
-                distance = closing_radius * progress**2
-                inner_section = centered_opening.buffer(
-                    distance, join_style="round"
-                ).buffer(-distance, join_style="round")
-                if not isinstance(inner_section, Polygon) or inner_section.is_empty:
-                    raise GeometryError("The connector opening could not be rounded safely.")
-        else:
-            outlet_progress = (
-                (fraction - smoothing_end_fraction) / (1.0 - smoothing_end_fraction)
-                if smoothing_distance > 0.0
-                else fraction
-            )
-            outlet_progress = float(np.clip(outlet_progress, 0.0, 1.0))
-            outlet_progress = 1.0 - (1.0 - outlet_progress) ** 2
-            inlet_points = rounded_inlet_points if smoothing_distance > 0.0 else base_inner
-            inner_section = Polygon(
-                inlet_points * (1.0 - outlet_progress)
-                + outlet_inner * outlet_progress
-            )
-        inner_section = orient(inner_section, sign=1.0)
-        if not inner_section.is_valid:
-            raise GeometryError(
-                "The funnel airflow path intersects itself. Increase the funnel length or use gentler settings."
-            )
-        outer_section = (
-            centered_outer
-            if fraction <= rounding_start_fraction + 1e-12
-            else inner_section.buffer(config.wall_thickness, join_style="round")
+            distance = conditioning_radius * _smoothstep(progress)
+            section = centered_opening.buffer(
+                distance, join_style="round"
+            ).buffer(-distance, join_style="round")
+            if not isinstance(section, Polygon) or section.is_empty:
+                raise GeometryError("The connector opening could not be rounded safely.")
+            return orient(section, sign=1.0)
+        progress = (fraction - conditioning_end_fraction) / (
+            1.0 - conditioning_end_fraction
         )
+        amount = _smoothstep(progress)
+        section = Polygon(
+            conditioned_points * (1.0 - amount) + outlet_inner * amount
+        )
+        if not section.is_valid:
+            raise GeometryError(
+                "The gradual funnel transition intersects itself. Increase the funnel length or choose another top opening."
+            )
+        return orient(section, sign=1.0)
+
+    inner_sections: list[Polygon] = []
+    for fraction in shape_fractions:
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        inner_sections.append(morph_section(fraction))
+
+    # A 2D offset alone can allow a concavity's inner and outer contours to
+    # close on almost the same layer. Looking ahead by one wall thickness makes
+    # the outside close first, leaving at least that much solid Z thickness over
+    # cable-access recesses and other disappearing inlet features.
+    roof_lookahead_fraction = config.wall_thickness / path_length
+    outer_sections: list[Polygon] = []
+    for fraction, inner_section in zip(shape_fractions, inner_sections, strict=True):
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        if fraction <= rounding_start_fraction + 1e-12:
+            outer_section = centered_outer
+        else:
+            outer_source = (
+                morph_section(min(1.0, fraction + roof_lookahead_fraction))
+                if concave_inlet
+                else inner_section
+            )
+            # The fan transition may expand one axis while contracting another.
+            # Keep today's airflow section as well as the look-ahead section so
+            # the reinforced outside can never cut into the current airway.
+            reinforced_source = unary_union((inner_section, outer_source))
+            outer_section = reinforced_source.buffer(
+                config.wall_thickness, join_style="round"
+            )
         if not isinstance(outer_section, Polygon) or not outer_section.is_valid:
             raise GeometryError("The funnel wall could not be offset from its airflow path.")
         if not outer_section.buffer(1e-7).covers(inner_section):
             raise GeometryError("The funnel wall does not contain its airflow path.")
-        inner_sections.append(inner_section)
         outer_sections.append(orient(outer_section, sign=1.0))
 
-    remaining_after_rounding = path_length * (1.0 - smoothing_end_fraction)
+    remaining_after_rounding = path_length * (1.0 - rounding_start_fraction)
     if concave_inlet and remaining_after_rounding < 8.0:
         warnings.append(
-            f"Only {remaining_after_rounding:.1f} mm remains after inlet rounding; increase the path length for a gentler fan transition."
+            f"Only {remaining_after_rounding:.1f} mm remains after rounding starts; increase the path length for a gentler transition."
         )
 
     outer_solid = _solid_from_cross_sections(

@@ -35,6 +35,7 @@ Preview controls:
 
 - Straight offsets move the fan in X/Y without rotating it.
 - **Rounding starts at** defaults to 8 mm. Set it to 0 mm for immediate smoothing, or increase it to carry cable-access and other sharp connector features farther into the funnel. A longer preserved section may require a longer funnel to avoid an abrupt fan transition.
+- After rounding starts, recessed features are eased into the fan opening over the remaining funnel length. Where a recess closes, the outside leads the airway by at least the detected wall thickness so the resulting roof is printable instead of a zero-thickness seam.
 - Connector spacing is the clear edge-to-edge gap between the connector STL bounding boxes, not center-to-center spacing.
 - GPU split distance is measured from the GPU openings toward the shared transition. Fan split distance is measured back from the fan openings. Short collector chambers merge each set of airtight ducts into the main funnel.
 - GPU bridges can span the full connector Z length or only a configurable thickness at the front (maximum-Z funnel end) or back. Fan bridges span the full plate depth.

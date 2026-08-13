@@ -31,6 +31,48 @@ GPU = ROOT / "GPU Connectors" / "cmp front.stl"
 FAN = ROOT / "Fans" / "default 120mm fan for shroud.stl"
 
 
+def _vertical_solid_intervals(
+    mesh: trimesh.Trimesh, x: float, y: float
+) -> list[tuple[float, float]]:
+    """Return solid Z intervals for a vertical ray away from triangle edges."""
+    triangles = np.asarray(mesh.triangles)
+    first = triangles[:, 0, :2]
+    edge_a = triangles[:, 1, :2] - first
+    edge_b = triangles[:, 2, :2] - first
+    point = np.array([x, y]) - first
+    denominator = edge_a[:, 0] * edge_b[:, 1] - edge_b[:, 0] * edge_a[:, 1]
+    usable = np.abs(denominator) > 1e-10
+    coordinate_a = np.zeros(len(triangles))
+    coordinate_b = np.zeros(len(triangles))
+    coordinate_a[usable] = (
+        point[usable, 0] * edge_b[usable, 1]
+        - edge_b[usable, 0] * point[usable, 1]
+    ) / denominator[usable]
+    coordinate_b[usable] = (
+        edge_a[usable, 0] * point[usable, 1]
+        - point[usable, 0] * edge_a[usable, 1]
+    ) / denominator[usable]
+    hits = (
+        usable
+        & (coordinate_a > 1e-8)
+        & (coordinate_b > 1e-8)
+        & (coordinate_a + coordinate_b < 1.0 - 1e-8)
+    )
+    heights = (
+        triangles[hits, 0, 2]
+        + coordinate_a[hits]
+        * (triangles[hits, 1, 2] - triangles[hits, 0, 2])
+        + coordinate_b[hits]
+        * (triangles[hits, 2, 2] - triangles[hits, 0, 2])
+    )
+    unique_heights: list[float] = []
+    for height in sorted(heights):
+        if not unique_heights or abs(height - unique_heights[-1]) > 1e-5:
+            unique_heights.append(float(height))
+    assert len(unique_heights) % 2 == 0
+    return list(zip(unique_heights[::2], unique_heights[1::2], strict=True))
+
+
 @pytest.fixture(scope="module")
 def connector():
     return analyze_connector(GPU)
@@ -129,15 +171,22 @@ def test_deep_slots_can_begin_smoothing_immediately_without_opening_the_wall() -
 
     assert result.mesh.is_watertight
     assert mesh_component_count(result.mesh) == 1
-    first_airway_area: float | None = None
+    early_airway: Polygon | None = None
+    later_airway: Polygon | None = None
     for height in (0.05, 0.21, 0.5, 1.0, 2.0, 4.0, 6.0, 7.9):
         contours = _slice_polygons(result.mesh, height)
         assert len(contours) == 2
         assert contours[0].contains(contours[1])
         if height == 0.5:
-            first_airway_area = contours[1].area
-    assert first_airway_area is not None
-    assert first_airway_area > opening.area
+            early_airway = contours[1]
+        if height == 4.0:
+            later_airway = contours[1]
+    assert early_airway is not None
+    assert later_airway is not None
+    early_change = early_airway.symmetric_difference(opening).area
+    later_change = later_airway.symmetric_difference(opening).area
+    assert early_change > 0.001
+    assert later_change > early_change * 5.0
 
 
 def test_rounding_start_preserves_cable_access_profile_before_transition() -> None:
@@ -171,11 +220,48 @@ def test_rounding_start_preserves_cable_access_profile_before_transition() -> No
     )
 
     before = _slice_polygons(result.mesh, 7.5)
-    after = _slice_polygons(result.mesh, 9.5)
+    after = _slice_polygons(result.mesh, 12.5)
     assert len(before) == 2
     assert len(after) == 2
     assert before[1].area == pytest.approx(opening.area, abs=1.0)
-    assert after[1].area > before[1].area + 1.0
+    assert after[1].symmetric_difference(before[1]).area > 5.0
+
+
+def test_disappearing_cable_slots_keep_a_full_thickness_roof() -> None:
+    wall_thickness = 2.0
+    opening = Polygon(
+        [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 80.0),
+            (72.0, 80.0),
+            (72.0, 34.0),
+            (61.0, 34.0),
+            (61.0, 80.0),
+            (39.0, 80.0),
+            (39.0, 34.0),
+            (28.0, 34.0),
+            (28.0, 80.0),
+            (0.0, 80.0),
+        ]
+    )
+    result = make_funnel(
+        opening,
+        0.0,
+        FunnelConfig(
+            wall_thickness=wall_thickness,
+            length=30.0,
+            rounding_start=8.0,
+            radial_segments=96,
+            path_segments=48,
+        ),
+        inlet_outer_polygon=opening.buffer(wall_thickness, join_style="round"),
+    )
+
+    for point in ((33.5, 60.0), (66.5, 60.0)):
+        intervals = _vertical_solid_intervals(result.mesh, *point)
+        assert len(intervals) == 1
+        assert intervals[0][1] - intervals[0][0] >= wall_thickness
 
 
 def test_reference_fan_measurements() -> None:
