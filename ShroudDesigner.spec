@@ -37,6 +37,8 @@ a = Analysis(
     binaries=opengl_binaries,
     datas=[
         (str(project / "GPU Connectors" / "cmp front.stl"), "GPU Connectors"),
+        (str(project / "GPU Connectors" / "cmp double front.stl"), "GPU Connectors"),
+        (str(project / "GPU Connectors" / "V100 Front.stl"), "GPU Connectors"),
         (str(project / "Fans" / "default 120mm fan for shroud.stl"), "Fans"),
         (str(project / "assets" / "shroud-designer.ico"), "assets"),
         (str(project / "assets" / "shroud-designer.png"), "assets"),
