@@ -1,5 +1,5 @@
 #define AppName "Shroud Designer"
-#define AppVersion "0.4.5"
+#define AppVersion "0.4.5.1"
 #define AppPublisher "Personal software"
 #define AppExeName "ShroudDesigner.exe"
 
@@ -13,7 +13,7 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=ShroudDesigner-0.4.5-Setup
+OutputBaseFilename=ShroudDesigner-0.4.5.1-Setup
 SetupIconFile=..\assets\shroud-designer.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/max

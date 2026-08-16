@@ -15,11 +15,11 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'Personal software'),
          StringStruct('FileDescription', 'GPU shroud design application'),
-         StringStruct('FileVersion', '0.4.5'),
+         StringStruct('FileVersion', '0.4.5.1'),
          StringStruct('InternalName', 'ShroudDesigner'),
          StringStruct('OriginalFilename', 'ShroudDesigner.exe'),
          StringStruct('ProductName', 'Shroud Designer'),
-         StringStruct('ProductVersion', '0.4.5')]
+         StringStruct('ProductVersion', '0.4.5.1')]
       )
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

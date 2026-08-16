@@ -20,9 +20,9 @@ Usage: ./build.sh [--skip-tests] [--skip-package]
 
 Produces:
   dist/ShroudDesigner/ShroudDesigner
-  dist/ShroudDesigner-0.4.5-linux-x86_64.tar.gz
+  dist/ShroudDesigner-0.4.5.1-linux-x86_64.tar.gz
   Shroud Designer Linux/   (portable app + install scripts)
-  public/ShroudDesigner-0.4.5-linux-x86_64.tar.gz
+  public/ShroudDesigner-0.4.5.1-linux-x86_64.tar.gz
 EOF
       exit 0
       ;;
@@ -79,7 +79,7 @@ if not report.get("ok"):
 print("Packaged self-test OK")
 PY
 
-VERSION="0.4.5"
+VERSION="0.4.5.1"
 TARBALL="$PROJECT_ROOT/dist/ShroudDesigner-${VERSION}-linux-x86_64.tar.gz"
 if [[ "$SKIP_PACKAGE" -eq 0 ]]; then
   tar \

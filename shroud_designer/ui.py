@@ -104,7 +104,7 @@ def _spin(
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Shroud Designer 0.4.5")
+        self.setWindowTitle("Shroud Designer 0.4.5.1")
         icon = app_icon_path()
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -143,7 +143,7 @@ class MainWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch()
-        version = QLabel("VERSION 0.4.5")
+        version = QLabel("VERSION 0.4.5.1")
         version.setObjectName("versionBadge")
         header_row.addWidget(version, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(header_row)
